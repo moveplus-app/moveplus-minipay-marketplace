@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=5"
+    />
+    <meta name="theme-color" content="#242424" />
+    <meta
+      name="description"
+      content="Move+ Web Marketplace — real goods catalog, Philippines delivery, Energy and MiniPay checkout."
+    />
+    <title>Move+ Marketplace</title>
+    <link rel="stylesheet" href="styles.css" />
+    <script src="config.js"></script>
+  </head>
+  <body>
+    <div id="app" class="app" aria-live="polite">
+      <header class="header safe-top">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">M+</div>
+          <div>
+            <h1 class="brand-title">Move+ Marketplace</h1>
+            <p class="brand-subtitle">Philippines delivery only</p>
+          </div>
+        </div>
+        <div id="wallet-pill" class="wallet-pill hidden" role="status"></div>
+      </header>
+
+      <div class="notice-bar">
+        <span>Off-chain product · On-chain payment verification</span>
+        <span class="notice-sep">·</span>
+        <span>Energy Points are separate from crypto checkout.</span>
+      </div>
+
+      <main id="main" class="main"></main>
+
+      <footer class="footer safe-bottom">
+        <p>Move+ Web Marketplace · Same catalog as the Move+ app</p>
+      </footer>
+    </div>
+    <script src="app.js" defer></script>
+  </body>
+</html>
