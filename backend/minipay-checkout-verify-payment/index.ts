@@ -3,8 +3,8 @@
  * Status-only query when tx_hash omitted (Check Payment Status).
  */
 
-import { serve } from 'https://deno.land/std@0.168.0/http/server.ts'
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
+import { serve } from 'https://'
+import { createClient } from 'https://'
 import {
   fetchTransactionReceipt,
   findErc20TransferToTreasury,
@@ -60,6 +60,71 @@ type SessionRow = {
   delivery_address: string
   comments: string | null
   expires_at: string
+  cart_items: Array<Record<string, unknown>> | null
+  total_quantity: number | null
+  energy_points_total: number | null
+}
+
+type CartItemSnapshot = {
+  marketplace_item_id: string
+  quantity: number
+  product_title_snapshot: string
+  energy_price_snapshot: number
+  crypto_unit_display?: string
+  token_symbol_snapshot?: string
+}
+
+function readCartItems(session: SessionRow): CartItemSnapshot[] {
+  if (!Array.isArray(session.cart_items) || session.cart_items.length === 0) {
+    return [{
+      marketplace_item_id: session.marketplace_item_id,
+      quantity: 1,
+      product_title_snapshot: 'Item',
+      energy_price_snapshot: 0,
+      token_symbol_snapshot: session.token_symbol,
+      crypto_unit_display: session.crypto_amount_display,
+    }]
+  }
+
+  return session.cart_items.map((row) => ({
+    marketplace_item_id: String(row.marketplace_item_id ?? session.marketplace_item_id),
+    quantity: Math.max(1, Math.floor(Number(row.quantity ?? 1))),
+    product_title_snapshot: String(row.product_title_snapshot ?? 'Item'),
+    energy_price_snapshot: Math.max(0, Math.floor(Number(row.energy_price_snapshot ?? 0))),
+    crypto_unit_display: row.crypto_unit_display ? String(row.crypto_unit_display) : undefined,
+    token_symbol_snapshot: row.token_symbol_snapshot
+      ? String(row.token_symbol_snapshot)
+      : session.token_symbol,
+  }))
+}
+
+async function insertOrderItems(
+  admin: ReturnType<typeof createClient>,
+  purchaseId: string,
+  session: SessionRow,
+  itemTitleFallback: string,
+) {
+  const lines = readCartItems(session)
+  const rows = lines.map((line) => ({
+    purchase_id: purchaseId,
+    marketplace_item_id: line.marketplace_item_id,
+    product_title_snapshot: line.product_title_snapshot || itemTitleFallback,
+    quantity: line.quantity,
+    energy_price_snapshot: line.energy_price_snapshot,
+    crypto_price_snapshot: line.crypto_unit_display ?? session.crypto_amount_display,
+    token_symbol_snapshot: line.token_symbol_snapshot ?? session.token_symbol,
+  }))
+
+  const { error } = await admin
+    .from('marketplace_order_items')
+    .upsert(rows, {
+      onConflict: 'purchase_id,marketplace_item_id',
+      ignoreDuplicates: true,
+    })
+
+  if (error) {
+    safeError('minipay_order_items_upsert_failed', { message: error.message })
+  }
 }
 
 async function loadSession(
@@ -288,6 +353,41 @@ serve(async (req) => {
       return json({ success: false, error: 'Product no longer available' }, 400)
     }
 
+    const cartLines = readCartItems(session)
+    for (const line of cartLines) {
+      const { data: lineItem } = await admin
+        .from('marketplace_items')
+        .select('id, title, is_available, is_deleted, stock_quantity')
+        .eq('id', line.marketplace_item_id)
+        .maybeSingle()
+
+      if (!lineItem || lineItem.is_deleted === true || lineItem.is_available !== true) {
+        return json({
+          success: false,
+          error: `Product no longer available: ${line.product_title_snapshot}`,
+        }, 400)
+      }
+
+      const stockRaw = lineItem.stock_quantity
+      const stock = stockRaw == null || stockRaw === ''
+        ? null
+        : Number.isFinite(Number(stockRaw))
+          ? Math.floor(Number(stockRaw))
+          : null
+      if (stock === 0) {
+        return json({
+          success: false,
+          error: `Product sold out: ${lineItem.title ?? line.product_title_snapshot}`,
+        }, 400)
+      }
+      if (stock != null && stock > 0 && line.quantity > stock) {
+        return json({
+          success: false,
+          error: `Insufficient stock for ${lineItem.title ?? line.product_title_snapshot}`,
+        }, 400)
+      }
+    }
+
     // Atomic claim: only one verify request may mark this session paid.
     const { data: claimed } = await admin
       .from('marketplace_minipay_sessions')
@@ -334,12 +434,16 @@ serve(async (req) => {
     let purchaseId = workingSession.purchase_id
 
     if (!purchaseId) {
+      const energyPaid = session.energy_points_total != null
+        ? Math.max(0, Math.floor(Number(session.energy_points_total)))
+        : 0
+
       const { data: purchase, error: purchaseErr } = await admin
         .from('purchases')
         .insert({
           user_id: workingSession.user_id,
           marketplace_item_id: workingSession.marketplace_item_id,
-          energy_points_paid: 0,
+          energy_points_paid: energyPaid,
           status: 'pending',
           customer_name: workingSession.customer_name,
           phone_number: workingSession.phone_number,
@@ -386,6 +490,10 @@ serve(async (req) => {
         }
       } else {
         purchaseId = purchase.id
+      }
+
+      if (purchaseId) {
+        await insertOrderItems(admin, purchaseId, workingSession, itemTitle)
       }
 
       if (!workingSession.purchase_id && purchaseId) {
