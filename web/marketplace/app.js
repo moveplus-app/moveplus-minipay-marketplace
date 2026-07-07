@@ -13,11 +13,17 @@ const CATEGORIES = [
   'Vouchers',
 ]
 
+const GEAR_CATEGORY_ORDER = ['All', 'Ronin', 'Base', 'Runner', 'Cycling', 'Founder']
+
 const ERC20_TRANSFER_SELECTOR = '0xa9059cbb'
+const CART_STORAGE_KEY = ''
 
 const state = {
   view: 'catalog',
+  catalogTab: 'real',
   items: [],
+  gearItems: [],
+  cart: [],
   selectedCategory: 'All',
   selectedItem: null,
   checkoutSession: null,
@@ -25,6 +31,7 @@ const state = {
   error: null,
   catalogMeta: null,
   isMiniPay: false,
+  toastTimer: null,
   ui: {
     menuOpen: false,
     searchOpen: false,
@@ -98,9 +105,17 @@ function resolveProductImages(row) {
   return single ? [single] : []
 }
 
+function readBoolField(value, defaultWhenNull = false) {
+  if (value === true || value === 'true' || value === 1 || value === '1') return true
+  if (value === false || value === 'false' || value === 0 || value === '0') return false
+  if (value === null || value === undefined || value === '') return defaultWhenNull
+  return Boolean(value)
+}
+
 /**
  * Map Supabase marketplace_items row to web catalog product.
- * Availability matches native Move+ app: is_available + is_deleted (not stock_quantity).
+ * Matches native SupabaseService.getMarketplaceItems() + MarketplaceItemModel.
+ * Native availability uses is_available (admin "In Stock"), not stock_quantity.
  */
 function normalizeMarketplaceProduct(row) {
   const stockRaw = row.stock_quantity
@@ -110,7 +125,22 @@ function normalizeMarketplaceProduct(row) {
       : Number.isFinite(Number(stockRaw))
         ? Number(stockRaw)
         : null
-  const isAvailable = row.is_available === true && row.is_deleted !== true
+
+  const isDeleted = readBoolField(row.is_deleted, false)
+  const isAvailableFlag = readBoolField(row.is_available, true)
+  const isAvailable = isAvailableFlag && !isDeleted
+
+  // Native Move+ uses is_available; stock_quantity=0 is sold out for web/MiniPay checkout.
+  const isSoldOut = !isAvailable || (stock !== null && stock === 0)
+
+  const cryptoPriceRaw = row.crypto_price
+  const cryptoPriceNum =
+    cryptoPriceRaw != null && cryptoPriceRaw !== ''
+      ? Number(cryptoPriceRaw)
+      : NaN
+  const cryptoPrice =
+    Number.isFinite(cryptoPriceNum) && cryptoPriceNum > 0 ? cryptoPriceNum : null
+  const cryptoSymbol = String(row.crypto_currency ?? '').trim() || null
 
   return {
     id: String(row.id ?? ''),
@@ -120,18 +150,18 @@ function normalizeMarketplaceProduct(row) {
     imageUrl: resolveProductImage(row),
     images: resolveProductImages(row),
     energyPrice: Number(row.energy_points_price ?? 0),
-    cryptoPrice: cfg().cryptoAmountDisplay || null,
-    cryptoSymbol: cfg().cryptoTokenSymbol || 'cUSD',
+    cryptoPrice,
+    cryptoSymbol,
     stock,
     isAvailable,
-    // Native marketplace does not block purchases when stock_quantity is 0/null.
-    isSoldOut: !isAvailable,
+    isSoldOut,
     createdAt: row.created_at ?? null,
   }
 }
 
 function stockDisplayLabel(product) {
   if (!product.isAvailable) return 'Unavailable'
+  if (product.stock === 0) return 'Sold out'
   if (product.stock == null) return 'Available'
   return String(product.stock)
 }
@@ -179,11 +209,342 @@ function resolveImageUrl(url) {
   return `${c.supabaseUrl}/storage/v1/object/public/${bucket}/${path}`
 }
 
-function cryptoPriceLabel() {
-  const c = cfg()
-  const amount = c.cryptoAmountDisplay || '—'
-  const token = c.cryptoTokenSymbol || 'cUSD'
-  return `${amount} ${token}`
+function formatProductCryptoLabel(product) {
+  if (!product || product.cryptoPrice == null) return null
+  const amount = Number(product.cryptoPrice)
+  if (!Number.isFinite(amount) || amount <= 0) return null
+  const symbol = product.cryptoSymbol || 'cUSD'
+  return `${formatMoneyAmount(amount)} ${symbol}`
+}
+
+function formatMoneyAmount(amount) {
+  const n = Number(amount)
+  if (!Number.isFinite(n)) return '—'
+  const rounded = Math.round(n * 100) / 100
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2)
+}
+
+function cryptoPriceLabel(product) {
+  if (product) {
+    const label = formatProductCryptoLabel(product)
+    if (label) return label
+  }
+  return '—'
+}
+
+function sumCartCryptoTotals(lines) {
+  let total = 0
+  let tokenSymbol = null
+  let hasPrice = false
+  for (const line of lines) {
+    const unit = Number(line.product.cryptoPrice)
+    if (!Number.isFinite(unit) || unit <= 0) continue
+    total += unit * line.quantity
+    hasPrice = true
+    if (!tokenSymbol && line.product.cryptoSymbol) {
+      tokenSymbol = line.product.cryptoSymbol
+    }
+  }
+  if (!hasPrice) {
+    return { display: '—', tokenSymbol: null, hasPrice: false }
+  }
+  return {
+    display: `${formatMoneyAmount(total)} ${tokenSymbol || 'cUSD'}`,
+    tokenSymbol: tokenSymbol || 'cUSD',
+    hasPrice: true,
+  }
+}
+
+/* ——— Cart (localStorage, product snapshots only — no PII) ——— */
+
+function loadCartFromStorage() {
+  try {
+    const raw = localStorage.getItem(CART_STORAGE_KEY)
+    if (!raw) {
+      state.cart = []
+      return
+    }
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) {
+      state.cart = []
+      return
+    }
+    state.cart = parsed
+      .filter((line) => line && line.productId && Number(line.quantity) > 0)
+      .map((line) => ({
+        productId: String(line.productId),
+        quantity: Math.max(1, Math.floor(Number(line.quantity))),
+        snapshot: line.snapshot ?? null,
+      }))
+  } catch (_) {
+    state.cart = []
+  }
+}
+
+function saveCartToStorage() {
+  try {
+    localStorage.setItem(CART_STORAGE_KEY, JSON.stringify(state.cart))
+  } catch (_) {
+    /* memory-only fallback */
+  }
+}
+
+function productSnapshot(product) {
+  return {
+    title: product.title,
+    description: product.description,
+    category: product.category,
+    imageUrl: product.imageUrl,
+    energyPrice: product.energyPrice,
+    cryptoPrice: product.cryptoPrice,
+    cryptoSymbol: product.cryptoSymbol,
+    stock: product.stock,
+    isSoldOut: product.isSoldOut,
+    isAvailable: product.isAvailable,
+  }
+}
+
+function resolveLiveProduct(productId) {
+  return state.items.find((p) => p.id === productId) ?? null
+}
+
+function resolveCartLine(line) {
+  const live = resolveLiveProduct(line.productId)
+  const snap = line.snapshot ?? {}
+  const merged = live
+    ? { ...snap, ...productSnapshot(live), productId: line.productId }
+    : { ...snap, productId: line.productId }
+  return {
+    productId: line.productId,
+    quantity: line.quantity,
+    product: {
+      id: line.productId,
+      title: merged.title || 'Product',
+      description: merged.description || '',
+      category: merged.category || '',
+      imageUrl: merged.imageUrl || null,
+      energyPrice: Number(merged.energyPrice ?? 0),
+      cryptoPrice: merged.cryptoPrice ?? null,
+      cryptoSymbol: merged.cryptoSymbol || null,
+      stock: merged.stock ?? null,
+      isSoldOut: live ? live.isSoldOut : Boolean(merged.isSoldOut),
+      isAvailable: live ? live.isAvailable : merged.isAvailable !== false,
+    },
+    missing: !live && !snap.title,
+  }
+}
+
+function getCartLines() {
+  return state.cart.map(resolveCartLine).filter((line) => !line.missing)
+}
+
+function getCartItemCount() {
+  return getCartLines().reduce((sum, line) => sum + line.quantity, 0)
+}
+
+function getMaxCartQuantity(product) {
+  if (!product || product.isSoldOut) return 0
+  if (product.stock === 0) return 0
+  if (product.stock == null) return 99
+  return Math.max(0, Math.min(99, product.stock))
+}
+
+function syncCartBadge() {
+  const badge = document.getElementById('cart-badge')
+  if (!badge) return
+  const count = getCartItemCount()
+  badge.textContent = String(count > 99 ? '99+' : count)
+  badge.classList.toggle('hidden', count <= 0)
+}
+
+function showToast(message, actionLabel, actionFn) {
+  const el = document.getElementById('mp-toast')
+  if (!el) return
+  if (state.toastTimer) clearTimeout(state.toastTimer)
+  el.classList.remove('hidden')
+  el.innerHTML = `
+    <span class="mp-toast-message">${escapeHtml(message)}</span>
+    ${actionLabel ? `<button type="button" class="mp-toast-action" id="mp-toast-action">${escapeHtml(actionLabel)}</button>` : ''}
+  `
+  document.getElementById('mp-toast-action')?.addEventListener('click', () => {
+    actionFn?.()
+    hideToast()
+  })
+  state.toastTimer = setTimeout(hideToast, 4000)
+}
+
+function hideToast() {
+  const el = document.getElementById('mp-toast')
+  if (!el) return
+  el.classList.add('hidden')
+  el.innerHTML = ''
+  if (state.toastTimer) {
+    clearTimeout(state.toastTimer)
+    state.toastTimer = null
+  }
+}
+
+function addToCart(product, quantity = 1) {
+  if (!product || isDigitalGear(product) || state.catalogTab === 'gear') return false
+  if (product.isSoldOut) return false
+  const qty = Math.max(1, Math.floor(Number(quantity) || 1))
+  const max = getMaxCartQuantity(product)
+  if (max <= 0) return false
+
+  const existing = state.cart.find((line) => line.productId === product.id)
+  const nextQty = Math.min(max, (existing?.quantity ?? 0) + qty)
+  if (existing) {
+    existing.quantity = nextQty
+    existing.snapshot = productSnapshot(product)
+  } else {
+    state.cart.push({
+      productId: product.id,
+      quantity: Math.min(max, qty),
+      snapshot: productSnapshot(product),
+    })
+  }
+  saveCartToStorage()
+  syncCartBadge()
+  showToast('Added to cart', 'View cart', () => setView('cart'))
+  return true
+}
+
+function setCartLineQuantity(productId, quantity) {
+  const line = state.cart.find((l) => l.productId === productId)
+  if (!line) return
+  const live = resolveLiveProduct(productId)
+  const max = live ? getMaxCartQuantity(live) : 99
+  const qty = Math.max(1, Math.min(max || 99, Math.floor(Number(quantity) || 1)))
+  line.quantity = qty
+  if (live) line.snapshot = productSnapshot(live)
+  saveCartToStorage()
+  syncCartBadge()
+}
+
+function removeFromCart(productId) {
+  state.cart = state.cart.filter((line) => line.productId !== productId)
+  saveCartToStorage()
+  syncCartBadge()
+  showToast('Item removed', null, null)
+}
+
+function clearCart() {
+  state.cart = []
+  saveCartToStorage()
+  syncCartBadge()
+}
+
+function getCartTotals() {
+  const lines = getCartLines()
+  const totalQuantity = lines.reduce((sum, line) => sum + line.quantity, 0)
+  const totalEnergy = lines.reduce(
+    (sum, line) => sum + line.product.energyPrice * line.quantity,
+    0,
+  )
+  const crypto = sumCartCryptoTotals(lines)
+  return {
+    lines,
+    totalQuantity,
+    totalEnergy,
+    cryptoSubtotal: crypto.display,
+    tokenSymbol: crypto.tokenSymbol,
+    hasCryptoPrices: crypto.hasPrice,
+  }
+}
+
+function buildCheckoutItemsPayload() {
+  return getCartLines().map((line) => ({
+    marketplace_item_id: line.productId,
+    quantity: line.quantity,
+  }))
+}
+
+function cartHasUnavailableItems() {
+  return getCartLines().some((line) => line.product.isSoldOut || !line.product.isAvailable)
+}
+
+function formatEnergyPriceHtml(amount) {
+  const formatted = Number(amount).toLocaleString()
+  return `<span class="price-energy-row"><span class="price-energy">${formatted}</span><img src="assets/icons/ic_energy.png" alt="" class="energy-icon" width="16" height="16" /></span>`
+}
+
+function isDigitalGear(item) {
+  return Boolean(item && (item.chain || item.filterChain) && item.gearType)
+}
+
+function loadGearPreview() {
+  const rows = window.MOVEPLUS_DIGITAL_GEAR_PREVIEW
+  state.gearItems = Array.isArray(rows)
+    ? rows.map((row) => ({
+        ...row,
+        id: String(row.id ?? ''),
+      }))
+    : []
+}
+
+function getGearCategories() {
+  const cats = new Set(['All'])
+  for (const gear of state.gearItems) {
+    if (gear.filterChain) cats.add(gear.filterChain)
+    if (gear.filterType) cats.add(gear.filterType)
+  }
+  return GEAR_CATEGORY_ORDER.filter((cat) => cats.has(cat))
+}
+
+function getActiveCategories() {
+  return state.catalogTab === 'gear' ? getGearCategories() : CATEGORIES
+}
+
+function matchesGearCategory(gear, category) {
+  if (category === 'All') return true
+  return gear.filterChain === category || gear.filterType === category || gear.category === category
+}
+
+function marketplaceToggleHtml() {
+  return `
+    <div class="marketplace-type-toggle" role="tablist" aria-label="Marketplace type">
+      <button type="button" class="marketplace-type-btn ${state.catalogTab === 'real' ? 'active' : ''}" data-catalog-tab="real" role="tab" aria-selected="${state.catalogTab === 'real'}">Real Items</button>
+      <button type="button" class="marketplace-type-btn ${state.catalogTab === 'gear' ? 'active' : ''}" data-catalog-tab="gear" role="tab" aria-selected="${state.catalogTab === 'gear'}">Digital Gear</button>
+    </div>
+  `
+}
+
+function setCatalogTab(tab) {
+  if (tab !== 'real' && tab !== 'gear') return
+  if (state.catalogTab === tab) return
+  state.catalogTab = tab
+  state.selectedCategory = 'All'
+  if (state.view === 'detail') {
+    state.selectedItem = null
+    state.view = 'catalog'
+  }
+  closeAllHeaderOverlays()
+  syncSearchPlaceholder()
+  render()
+  syncWalletDetection()
+}
+
+function syncSearchPlaceholder() {
+  const input = document.getElementById('search-input')
+  if (!input) return
+  input.placeholder = state.catalogTab === 'gear' ? 'Search digital gear' : 'Search products'
+}
+
+function bindCatalogTabHandlers(root) {
+  root.querySelectorAll('[data-catalog-tab]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      setCatalogTab(btn.getAttribute('data-catalog-tab') || 'real')
+    })
+  })
+}
+
+function bindCategoryChipHandlers(root) {
+  root.querySelectorAll('[data-category]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      state.selectedCategory = btn.getAttribute('data-category') || 'All'
+      render()
+    })
+  })
 }
 
 function friendlyFetchError(err) {
@@ -268,6 +629,8 @@ function demoProducts() {
       description: 'Lightweight cap for training. Demo product for empty catalog preview.',
       image_url: null,
       energy_points_price: 1200,
+      crypto_price: 1.0,
+      crypto_currency: 'cUSD',
       category: 'Apparel',
       stock_quantity: 5,
       is_available: true,
@@ -288,7 +651,7 @@ async function loadCatalog() {
   try {
     // Same filters as native SupabaseService.getMarketplaceItems()
     const select =
-      'id,title,description,image_url,energy_points_price,category,stock_quantity,is_available,is_deleted,created_at,updated_at'
+      'id,title,description,image_url,energy_points_price,crypto_price,crypto_currency,category,stock_quantity,is_available,is_deleted,created_at,updated_at'
     const query = `${table}?select=${select}&is_available=eq.true&is_deleted=eq.false&order=created_at.desc`
     let rows = await supabaseRest(query)
     if (!Array.isArray(rows)) rows = []
@@ -302,10 +665,13 @@ async function loadCatalog() {
 
     state.catalogMeta = {
       source: sourceLabel,
+      stockField: 'stock_quantity',
+      availabilityField: 'is_available',
       rowCount: products.length,
       rawRowCount: rows.length,
       firstRowStock: rows[0]?.stock_quantity ?? '—',
       firstRowAvailable: rows[0]?.is_available ?? '—',
+      firstProductIsSoldOut: products[0]?.isSoldOut ?? '—',
       demoMode: isDemoMode(),
     }
 
@@ -318,10 +684,13 @@ async function loadCatalog() {
     state.error = 'Could not load marketplace products. Please try again.'
     state.catalogMeta = {
       source: sourceLabel,
+      stockField: 'stock_quantity',
+      availabilityField: 'is_available',
       rowCount: 0,
       rawRowCount: 0,
       firstRowStock: '—',
       firstRowAvailable: '—',
+      firstProductIsSoldOut: '—',
       demoMode: isDemoMode(),
       fetchError: String(err?.message ?? err),
     }
@@ -377,7 +746,32 @@ function filteredItems() {
   return items
 }
 
+function filteredGearItems() {
+  let items = [...state.gearItems]
+
+  if (state.selectedCategory !== 'All') {
+    items = items.filter((gear) => matchesGearCategory(gear, state.selectedCategory))
+  }
+
+  const q = state.ui.searchQuery.trim().toLowerCase()
+  if (q) {
+    items = items.filter((gear) => {
+      const hay = `${gear.title} ${gear.description} ${gear.chain} ${gear.gearType} ${gear.rarity} ${gear.category}`.toLowerCase()
+      return hay.includes(q)
+    })
+  }
+
+  if (state.filters.sort === 'newest') {
+    items.sort((a, b) => String(a.title).localeCompare(String(b.title)))
+  }
+
+  return items
+}
+
 function hasActiveFilters() {
+  if (state.catalogTab === 'gear') {
+    return state.selectedCategory !== 'All' || state.filters.sort !== 'featured'
+  }
   return (
     state.filters.sort !== 'featured' ||
     state.filters.availability !== 'all' ||
@@ -387,12 +781,20 @@ function hasActiveFilters() {
 }
 
 function setView(view, payload = {}) {
+  if (view === 'payment' && !state.checkoutSession) {
+    view = state.cart.length > 0 ? 'checkout' : 'catalog'
+  }
+  if ((view === 'checkout' || view === 'payment') && (state.catalogTab !== 'real' || getCartLines().length === 0)) {
+    view = 'cart'
+  }
   state.view = view
   if (payload.item) state.selectedItem = payload.item
   if (payload.session) state.checkoutSession = payload.session
   closeAllHeaderOverlays()
+  hideToast()
   render()
   syncWalletDetection()
+  syncCartBadge()
   window.scrollTo({ top: 0, behavior: 'smooth' })
 }
 
@@ -405,6 +807,7 @@ function productCardHtml(product) {
   const imageBlock = img
     ? `<img class="product-image" src="${escapeHtml(img)}" alt="" loading="lazy" />`
     : `<div class="product-image placeholder">No image</div>`
+  const cryptoLabel = formatProductCryptoLabel(product) || '—'
 
   return `
     <button type="button" class="product-card" data-item-id="${escapeHtml(product.id)}" ${product.isSoldOut ? 'disabled' : ''}>
@@ -415,28 +818,101 @@ function productCardHtml(product) {
       <div class="product-body">
         <h2 class="product-title">${escapeHtml(product.title)}</h2>
         <div class="price-row">
-          <span class="price-energy">${Number(product.energyPrice).toLocaleString()} EP</span>
-          <span class="price-crypto">${escapeHtml(cryptoPriceLabel())}</span>
+          ${formatEnergyPriceHtml(product.energyPrice)}
         </div>
+        <div class="price-crypto">${escapeHtml(cryptoLabel)}</div>
+      </div>
+    </button>
+  `
+}
+
+function gearCardHtml(gear) {
+  const img = gear.imageUrl
+  const imageBlock = img
+    ? `<img class="product-image" src="${escapeHtml(img)}" alt="" loading="lazy" />`
+    : `<div class="product-image placeholder">Preview</div>`
+
+  const stats = []
+  if (gear.dailyCap && gear.dailyCap !== '—') stats.push(`Daily cap: ${gear.dailyCap}`)
+  if (gear.multiplier && gear.multiplier !== '—') stats.push(`${gear.multiplier}`)
+  if (gear.repairDiscount && gear.repairDiscount !== '—' && stats.length < 2) {
+    stats.push(`Repair: ${gear.repairDiscount}`)
+  }
+
+  return `
+    <button type="button" class="product-card gear-card" data-gear-id="${escapeHtml(gear.id)}">
+      <div class="product-image-wrap">
+        ${imageBlock}
+      </div>
+      <div class="product-body">
+        <div class="gear-badge-row">
+          ${gear.chain ? `<span class="gear-badge chain">${escapeHtml(gear.chain)}</span>` : ''}
+          ${gear.gearType ? `<span class="gear-badge">${escapeHtml(gear.gearType)}</span>` : ''}
+          ${gear.rarity ? `<span class="gear-badge">${escapeHtml(gear.rarity)}</span>` : ''}
+        </div>
+        <h2 class="product-title">${escapeHtml(gear.title)}</h2>
+        ${stats.length ? `<div class="gear-stat">${escapeHtml(stats.join(' · '))}</div>` : ''}
+        <div class="gear-stat">View in Move+ app</div>
       </div>
     </button>
   `
 }
 
 function renderCatalog(main) {
+  const toggle = marketplaceToggleHtml()
+
+  if (state.catalogTab === 'gear') {
+    const items = filteredGearItems()
+    const categories = getGearCategories()
+    const chips = categories
+      .map(
+        (cat) =>
+          `<button type="button" class="chip ${state.selectedCategory === cat ? 'active' : ''}" data-category="${escapeHtml(cat)}">${escapeHtml(cat)}</button>`,
+      )
+      .join('')
+
+    main.innerHTML = `
+      ${toggle}
+      <div class="chips" role="tablist">${chips}</div>
+      ${
+        items.length === 0
+          ? `<section class="card empty"><p>No digital gear in this category.</p></section>`
+          : `<div class="grid" id="gear-grid">${items.map(gearCardHtml).join('')}</div>`
+      }
+      ${diagnosticsHtml()}
+    `
+
+    bindCatalogTabHandlers(main)
+    bindCategoryChipHandlers(main)
+    main.querySelectorAll('[data-gear-id]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const id = btn.getAttribute('data-gear-id')
+        const gear = state.gearItems.find((g) => g.id === id)
+        if (gear) setView('detail', { item: gear })
+      })
+    })
+    return
+  }
+
   if (state.loading) {
-    main.innerHTML = `<section class="card loading"><div class="spinner"></div><p>Loading marketplace…</p></section>`
+    main.innerHTML = `
+      ${toggle}
+      <section class="card loading"><div class="spinner"></div><p>Loading marketplace…</p></section>
+    `
+    bindCatalogTabHandlers(main)
     return
   }
 
   if (state.error) {
     main.innerHTML = `
+      ${toggle}
       <section class="card error">
         <p>${escapeHtml(state.error)}</p>
         <button type="button" class="btn btn-secondary" id="retry-catalog" style="margin-top:12px">Retry</button>
       </section>
       ${diagnosticsHtml()}
     `
+    bindCatalogTabHandlers(main)
     document.getElementById('retry-catalog')?.addEventListener('click', loadCatalog)
     return
   }
@@ -452,6 +928,7 @@ function renderCatalog(main) {
   ).join('')
 
   main.innerHTML = `
+    ${toggle}
     <div class="chips" role="tablist">${chips}</div>
     ${
       items.length === 0
@@ -461,12 +938,8 @@ function renderCatalog(main) {
     ${diagnosticsHtml()}
   `
 
-  main.querySelectorAll('[data-category]').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      state.selectedCategory = btn.getAttribute('data-category') || 'All'
-      render()
-    })
-  })
+  bindCatalogTabHandlers(main)
+  bindCategoryChipHandlers(main)
 
   main.querySelectorAll('[data-item-id]').forEach((btn) => {
     btn.addEventListener('click', () => {
@@ -477,16 +950,15 @@ function renderCatalog(main) {
   })
 }
 
-function renderDetail(main) {
-  const product = state.selectedItem
-  if (!product) {
+function renderGearDetail(main) {
+  const gear = state.selectedItem
+  if (!gear || !isDigitalGear(gear)) {
     setView('catalog')
     return
   }
 
-  const img = product.imageUrl
-  const minipayEnabled = cfg().enableMiniPayCheckout !== false
-  const inMiniPay = isMiniPayWallet()
+  const img = gear.imageUrl
+  const appUrl = cfg().moveplusAppDeepLink || cfg().moveplusHomeUrl || 'https://'
 
   main.innerHTML = `
     <button type="button" class="btn btn-ghost" id="back-catalog">← Back to catalog</button>
@@ -494,6 +966,67 @@ function renderDetail(main) {
       ${
         img
           ? `<img src="${escapeHtml(img)}" alt="" />`
+          : `<div class="product-image placeholder" style="height:100%">Preview</div>`
+      }
+    </div>
+    <section class="card">
+      <div class="gear-badge-row" style="margin-bottom:10px">
+        ${gear.chain ? `<span class="gear-badge chain">${escapeHtml(gear.chain)}</span>` : ''}
+        ${gear.gearType ? `<span class="gear-badge">${escapeHtml(gear.gearType)}</span>` : ''}
+        ${gear.rarity ? `<span class="gear-badge">${escapeHtml(gear.rarity)}</span>` : ''}
+      </div>
+      <h2 class="detail-title">${escapeHtml(gear.title)}</h2>
+      <p class="detail-desc">${escapeHtml(gear.description || 'Digital gear preview.')}</p>
+      <div class="meta-row"><span class="meta-label">Chain</span><span class="meta-value">${escapeHtml(gear.chain || '—')}</span></div>
+      <div class="meta-row"><span class="meta-label">Gear type</span><span class="meta-value">${escapeHtml(gear.gearType || '—')}</span></div>
+      <div class="meta-row"><span class="meta-label">Rarity</span><span class="meta-value">${escapeHtml(gear.rarity || '—')}</span></div>
+      <div class="meta-row"><span class="meta-label">Daily cap</span><span class="meta-value">${escapeHtml(gear.dailyCap || '—')}</span></div>
+      <div class="meta-row"><span class="meta-label">Multiplier</span><span class="meta-value">${escapeHtml(gear.multiplier || '—')}</span></div>
+      <div class="meta-row"><span class="meta-label">Repair</span><span class="meta-value">${escapeHtml(gear.repairDiscount || '—')}</span></div>
+    </section>
+    <section class="card">
+      <div class="alert alert-info">Digital gear purchase is available inside Move+.</div>
+    </section>
+    ${diagnosticsHtml()}
+    <div class="action-bar" id="gear-detail-actions">
+      <button type="button" class="btn btn-primary" id="open-moveplus-app">Open Move+ App</button>
+      <button type="button" class="btn btn-secondary" id="view-gear-back">View Gear</button>
+    </div>
+  `
+
+  document.getElementById('back-catalog')?.addEventListener('click', () => setView('catalog'))
+  document.getElementById('view-gear-back')?.addEventListener('click', () => setView('catalog'))
+  document.getElementById('open-moveplus-app')?.addEventListener('click', () => {
+    openExternalUrl(appUrl)
+  })
+}
+
+function renderDetail(main) {
+  const product = state.selectedItem
+  if (!product) {
+    setView('catalog')
+    return
+  }
+
+  if (isDigitalGear(product)) {
+    renderGearDetail(main)
+    return
+  }
+
+  const img = product.imageUrl
+  const images = product.images?.length ? product.images : img ? [img] : []
+  const soldOut = product.isSoldOut
+  const manualOrderNote =
+    product.category === 'Vouchers'
+      ? 'This item may be fulfilled manually after order review.'
+      : 'Physical orders are reviewed before fulfillment.'
+
+  main.innerHTML = `
+    <button type="button" class="btn btn-ghost" id="back-catalog">← Back to catalog</button>
+    <div class="detail-hero">
+      ${
+        images.length > 0
+          ? `<img src="${escapeHtml(images[0])}" alt="" />`
           : `<div class="product-image placeholder" style="height:100%">No image</div>`
       }
     </div>
@@ -501,23 +1034,189 @@ function renderDetail(main) {
       <h2 class="detail-title">${escapeHtml(product.title)}</h2>
       <p class="detail-desc">${escapeHtml(product.description || 'No description provided.')}</p>
       <div class="meta-row"><span class="meta-label">Category</span><span class="meta-value">${escapeHtml(product.category || '—')}</span></div>
-      <div class="meta-row"><span class="meta-label">Energy price</span><span class="meta-value">${Number(product.energyPrice).toLocaleString()} EP</span></div>
-      <div class="meta-row"><span class="meta-label">Crypto price</span><span class="meta-value">${escapeHtml(cryptoPriceLabel())} · ${escapeHtml(cfg().chainName || 'Celo')}</span></div>
+      <div class="meta-row"><span class="meta-label">Energy price</span><span class="meta-value">${formatEnergyPriceHtml(product.energyPrice)}</span></div>
+      <div class="meta-row"><span class="meta-label">Crypto price</span><span class="meta-value">${escapeHtml(formatProductCryptoLabel(product) || '—')} · ${escapeHtml(cfg().chainName || 'Celo')}</span></div>
       <div class="meta-row"><span class="meta-label">Delivery</span><span class="meta-value">Philippines only</span></div>
       <div class="meta-row"><span class="meta-label">Stock</span><span class="meta-value">${escapeHtml(stockDisplayLabel(product))}</span></div>
     </section>
     <section class="card">
-      <div class="alert alert-info">Energy redemption is available inside the Move+ app. Open Move+ to pay with Energy Points.</div>
-      ${
-        !inMiniPay
-          ? `<div class="alert alert-warn">Open inside MiniPay to pay with ${escapeHtml(cfg().cryptoTokenSymbol || 'MiniPay')}. Wallet signing is unavailable in a normal browser.</div>`
-          : minipayEnabled
-            ? `<div class="alert alert-info">MiniPay detected. You can complete crypto checkout below.</div>`
-            : `<div class="alert alert-warn">MiniPay checkout is coming soon.</div>`
+      <div class="alert alert-info">${escapeHtml(manualOrderNote)}</div>
+      ${soldOut ? `<div class="alert alert-warn">This product is currently unavailable.</div>` : ''}
+    </section>
+    ${diagnosticsHtml()}
+    <div class="action-bar" id="detail-actions">
+      <button type="button" class="btn btn-secondary ${soldOut ? 'btn-disabled' : ''}" id="add-to-cart-btn" ${soldOut ? 'disabled' : ''}>Add to Cart</button>
+      <button type="button" class="btn btn-primary ${soldOut ? 'btn-disabled' : ''}" id="buy-now-btn" ${soldOut ? 'disabled' : ''}>Buy Now</button>
+    </div>
+  `
+
+  document.getElementById('back-catalog')?.addEventListener('click', () => setView('catalog'))
+  document.getElementById('add-to-cart-btn')?.addEventListener('click', () => {
+    if (addToCart(product, 1)) render()
+  })
+  document.getElementById('buy-now-btn')?.addEventListener('click', () => {
+    if (!addToCart(product, 1)) return
+    setView('checkout')
+  })
+}
+
+function renderCart(main) {
+  const totals = getCartTotals()
+  const lines = totals.lines
+
+  if (lines.length === 0) {
+    main.innerHTML = `
+      <section class="card empty">
+        <h2 class="detail-title" style="font-size:17px">Your cart is empty.</h2>
+        <p class="detail-desc">Browse real items and add products to your cart.</p>
+        <button type="button" class="btn btn-primary" id="browse-products" style="margin-top:12px">Browse products</button>
+      </section>
+      ${diagnosticsHtml()}
+    `
+    document.getElementById('browse-products')?.addEventListener('click', () => {
+      state.catalogTab = 'real'
+      setView('catalog')
+    })
+    return
+  }
+
+  const lineHtml = lines
+    .map((line) => {
+      const p = line.product
+      const maxQty = getMaxCartQuantity(p)
+      const thumb = p.imageUrl
+        ? `<img class="cart-thumb" src="${escapeHtml(p.imageUrl)}" alt="" />`
+        : `<div class="cart-thumb placeholder">—</div>`
+      return `
+        <article class="cart-line" data-cart-line="${escapeHtml(line.productId)}">
+          ${thumb}
+          <div class="cart-line-body">
+            <h3 class="cart-line-title">${escapeHtml(p.title)}</h3>
+            <div class="cart-line-price">${formatEnergyPriceHtml(p.energyPrice)}</div>
+            <div class="cart-line-crypto">${escapeHtml(formatProductCryptoLabel(p) || '—')} each</div>
+            ${
+              p.isSoldOut
+                ? `<div class="cart-line-warn">Unavailable — remove to continue</div>`
+                : `<div class="qty-row">
+                    <button type="button" class="qty-btn" data-qty-dec="${escapeHtml(line.productId)}" aria-label="Decrease quantity">−</button>
+                    <input type="number" class="qty-input" min="1" max="${maxQty}" value="${line.quantity}" data-qty-input="${escapeHtml(line.productId)}" inputmode="numeric" />
+                    <button type="button" class="qty-btn" data-qty-inc="${escapeHtml(line.productId)}" aria-label="Increase quantity">+</button>
+                  </div>`
+            }
+            <button type="button" class="cart-remove" data-cart-remove="${escapeHtml(line.productId)}">Remove</button>
+          </div>
+        </article>
+      `
+    })
+    .join('')
+
+  main.innerHTML = `
+    <button type="button" class="btn btn-ghost" id="back-catalog">← Continue shopping</button>
+    <section class="card">
+      <h2 class="detail-title" style="font-size:17px">Cart (${totals.totalQuantity})</h2>
+      <div class="cart-lines">${lineHtml}</div>
+    </section>
+    <section class="card">
+      <div class="meta-row"><span class="meta-label">Energy subtotal</span><span class="meta-value">${formatEnergyPriceHtml(totals.totalEnergy)}</span></div>
+      <div class="meta-row"><span class="meta-label">Crypto subtotal</span><span class="meta-value">${escapeHtml(totals.cryptoSubtotal)}</span></div>
+      <div class="meta-row"><span class="meta-label">Delivery</span><span class="meta-value">Philippines only</span></div>
+      <p class="detail-desc" style="margin-top:8px">Display totals are estimates. Payment amount is calculated by the server at checkout.</p>
+    </section>
+    ${cartHasUnavailableItems() ? `<section class="card"><div class="alert alert-warn">Remove unavailable items before checkout.</div></section>` : ''}
+    ${diagnosticsHtml()}
+    <div class="action-bar">
+      <button type="button" class="btn btn-secondary" id="continue-shopping">Continue Shopping</button>
+      <button type="button" class="btn btn-primary ${cartHasUnavailableItems() ? 'btn-disabled' : ''}" id="cart-checkout-btn" ${cartHasUnavailableItems() ? 'disabled' : ''}>Checkout</button>
+    </div>
+  `
+
+  document.getElementById('back-catalog')?.addEventListener('click', () => setView('catalog'))
+  document.getElementById('continue-shopping')?.addEventListener('click', () => setView('catalog'))
+  document.getElementById('cart-checkout-btn')?.addEventListener('click', () => setView('checkout'))
+
+  main.querySelectorAll('[data-qty-dec]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const id = btn.getAttribute('data-qty-dec')
+      const line = state.cart.find((l) => l.productId === id)
+      if (!line) return
+      if (line.quantity <= 1) {
+        removeFromCart(id)
+      } else {
+        setCartLineQuantity(id, line.quantity - 1)
+        showToast('Quantity updated', null, null)
       }
+      renderCart(main)
+    })
+  })
+  main.querySelectorAll('[data-qty-inc]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const id = btn.getAttribute('data-qty-inc')
+      const line = state.cart.find((l) => l.productId === id)
+      if (!line) return
+      setCartLineQuantity(id, line.quantity + 1)
+      showToast('Quantity updated', null, null)
+      renderCart(main)
+    })
+  })
+  main.querySelectorAll('[data-qty-input]').forEach((input) => {
+    input.addEventListener('change', () => {
+      const id = input.getAttribute('data-qty-input')
+      setCartLineQuantity(id, input.value)
+      showToast('Quantity updated', null, null)
+      renderCart(main)
+    })
+  })
+  main.querySelectorAll('[data-cart-remove]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      removeFromCart(btn.getAttribute('data-cart-remove'))
+      renderCart(main)
+    })
+  })
+}
+
+function renderCheckoutSummaryHtml(totals) {
+  return totals.lines
+    .map(
+      (line) => `
+      <div class="checkout-line">
+        <span>${escapeHtml(line.product.title)} × ${line.quantity}</span>
+        <span>${formatEnergyPriceHtml(line.product.energyPrice * line.quantity)}</span>
+      </div>
+    `,
+    )
+    .join('')
+}
+
+function renderCheckoutForm(main) {
+  const totals = getCartTotals()
+  if (totals.lines.length === 0) {
+    setView('cart')
+    return
+  }
+  if (cartHasUnavailableItems()) {
+    setView('cart')
+    return
+  }
+
+  const minipayEnabled = cfg().enableMiniPayCheckout !== false
+  const inMiniPay = isMiniPayWallet()
+  const appUrl = cfg().moveplusAppDeepLink || cfg().moveplusHomeUrl || 'https://'
+  const minipayReady = minipayEnabled && inMiniPay && totals.hasCryptoPrices
+  const minipayBlockedReason = !totals.hasCryptoPrices
+    ? 'Set crypto prices in Admin Dashboard before MiniPay checkout.'
+    : null
+
+  main.innerHTML = `
+    <button type="button" class="btn btn-ghost" id="back-cart">← Back to cart</button>
+    <section class="card">
+      <h2 class="detail-title" style="font-size:17px">Checkout</h2>
+      <div class="checkout-summary">${renderCheckoutSummaryHtml(totals)}</div>
+      <div class="meta-row"><span class="meta-label">Total Energy</span><span class="meta-value">${formatEnergyPriceHtml(totals.totalEnergy)}</span></div>
+      <div class="meta-row"><span class="meta-label">Total crypto (est.)</span><span class="meta-value">${escapeHtml(totals.cryptoSubtotal)}</span></div>
+      <div class="meta-row"><span class="meta-label">Delivery</span><span class="meta-value">Philippines only</span></div>
     </section>
     <section class="card" id="checkout-form-card">
-      <h3 style="margin:0 0 12px;font-size:15px">Checkout details</h3>
+      <h3 style="margin:0 0 12px;font-size:15px">Delivery details</h3>
       <form id="checkout-form">
         <div class="form-group"><label for="customer_name">Full name</label><input id="customer_name" name="customer_name" required autocomplete="name" /></div>
         <div class="form-group"><label for="phone_number">Phone</label><input id="phone_number" name="phone_number" required autocomplete="tel" /></div>
@@ -527,36 +1226,51 @@ function renderDetail(main) {
       </form>
       <div id="checkout-status"></div>
     </section>
+    <section class="card">
+      <div class="alert alert-info">Energy redemption is available inside the Move+ app. Open Move+ to pay with Energy Points.</div>
+      ${
+        minipayBlockedReason
+          ? `<div class="alert alert-warn">${escapeHtml(minipayBlockedReason)}</div>`
+          : ''
+      }
+      ${
+        !inMiniPay
+          ? `<div class="alert alert-warn">Wallet signing is unavailable in a normal browser. Open inside MiniPay to pay with crypto.</div>`
+          : minipayEnabled
+            ? `<div class="alert alert-info">MiniPay detected. Server will calculate your final payment amount from product prices.</div>`
+            : `<div class="alert alert-warn">MiniPay checkout is coming soon.</div>`
+      }
+    </section>
     ${diagnosticsHtml()}
-    <div class="action-bar" id="detail-actions">
+    <div class="action-bar" id="checkout-actions">
       <button type="button" class="btn btn-secondary" id="energy-info-btn">Pay with Energy in Move+ app</button>
-      <button type="button" class="btn btn-primary ${!inMiniPay || !minipayEnabled || product.isSoldOut ? 'btn-disabled' : ''}" id="minipay-checkout-btn" ${!inMiniPay || !minipayEnabled || product.isSoldOut ? 'disabled' : ''}>
-        ${inMiniPay && minipayEnabled && !product.isSoldOut ? `Pay ${escapeHtml(cryptoPriceLabel())} with MiniPay` : 'Open inside MiniPay to pay'}
+      <button type="button" class="btn btn-primary ${!minipayReady ? 'btn-disabled' : ''}" id="minipay-checkout-btn" ${!minipayReady ? 'disabled' : ''}>
+        ${minipayReady ? `Pay ${escapeHtml(totals.cryptoSubtotal)} with MiniPay` : 'Open inside MiniPay to pay'}
       </button>
     </div>
   `
 
-  document.getElementById('back-catalog')?.addEventListener('click', () => setView('catalog'))
+  document.getElementById('back-cart')?.addEventListener('click', () => setView('cart'))
   document.getElementById('energy-info-btn')?.addEventListener('click', () => {
-    alert('Energy redemption is available inside the Move+ app marketplace.')
+    openExternalUrl(appUrl)
   })
-
-  const payBtn = document.getElementById('minipay-checkout-btn')
-  payBtn?.addEventListener('click', () => startMinipayCheckout(product))
+  document.getElementById('minipay-checkout-btn')?.addEventListener('click', () => startMinipayCheckout())
 }
 
-async function startMinipayCheckout(product) {
+async function startMinipayCheckout() {
+  if (state.catalogTab !== 'real') return
   if (!isMiniPayWallet()) return
   if (cfg().enableMiniPayCheckout === false) return
+  if (getCartLines().length === 0) return
+  if (cartHasUnavailableItems()) return
 
   const form = document.getElementById('checkout-form')
   const statusEl = document.getElementById('checkout-status')
   if (!form || !statusEl) return
-
   if (!form.reportValidity()) return
 
   const body = {
-    marketplace_item_id: product.id,
+    items: buildCheckoutItemsPayload(),
     customer_name: form.customer_name.value.trim(),
     phone_number: form.phone_number.value.trim(),
     email: form.email.value.trim(),
@@ -578,12 +1292,11 @@ async function startMinipayCheckout(product) {
       throw new Error(friendlyApiError(status, data))
     }
 
-    setView('checkout', {
-      item: product,
+    setView('payment', {
       session: {
         sessionId: data.session_id,
         sessionToken: data.session_token,
-        itemTitle: data.item_title || product.title,
+        itemTitle: data.item_title || 'Order',
         amountDisplay: data.amount_display,
         tokenSymbol: data.token_symbol,
         chainName: data.chain_name || 'Celo',
@@ -592,48 +1305,45 @@ async function startMinipayCheckout(product) {
         tokenAddress: data.token_address,
         chainId: data.chain_id,
         expiresAt: data.expires_at,
+        cartItems: data.cart_items ?? null,
+        totalQuantity: data.total_quantity ?? null,
       },
     })
   } catch (err) {
     statusEl.innerHTML = `<div class="alert alert-error">${escapeHtml(String(err.message ?? err))}</div>`
     if (payBtn) {
       payBtn.disabled = false
-      payBtn.textContent = `Pay ${cryptoPriceLabel()} with MiniPay`
+      const totals = getCartTotals()
+      payBtn.textContent = `Pay ${totals.cryptoSubtotal} with MiniPay`
     }
   }
 }
 
-async function invokeVerify(body) {
-  const fn = cfg().verifyFunction || 'minipay-checkout-verify-payment'
-  return invokeFunction(fn, body)
-}
-
-function renderCheckout(main) {
+function renderPayment(main) {
   const session = state.checkoutSession
-  const item = state.selectedItem
-  if (!session) {
-    setView('catalog')
+  if (!session || state.catalogTab !== 'real') {
+    setView('cart')
     return
   }
 
   const inMiniPay = isMiniPayWallet()
   const payLabel = inMiniPay
-    ? `Pay ${escapeHtml(session.amountDisplay || cryptoPriceLabel())} ${escapeHtml(session.tokenSymbol || '')}`.trim()
+    ? `Pay ${escapeHtml(session.amountDisplay || '—')}`.trim()
     : 'Open inside MiniPay to pay'
 
   main.innerHTML = `
-    <button type="button" class="btn btn-ghost" id="back-detail">← Back to product</button>
+    <button type="button" class="btn btn-ghost" id="back-checkout">← Back to checkout</button>
     <section class="card">
-      <h2 class="detail-title" style="font-size:17px">Checkout</h2>
-      <div class="meta-row"><span class="meta-label">Product</span><span class="meta-value">${escapeHtml(session.itemTitle || item?.title || 'Item')}</span></div>
-      <div class="meta-row"><span class="meta-label">Amount</span><span class="meta-value">${escapeHtml(session.amountDisplay || '—')} ${escapeHtml(session.tokenSymbol || '')}</span></div>
+      <h2 class="detail-title" style="font-size:17px">Payment</h2>
+      <div class="meta-row"><span class="meta-label">Order</span><span class="meta-value">${escapeHtml(session.itemTitle || 'Items')}</span></div>
+      <div class="meta-row"><span class="meta-label">Amount</span><span class="meta-value">${escapeHtml(session.amountDisplay || '—')}</span></div>
       <div class="meta-row"><span class="meta-label">Network</span><span class="meta-value">${escapeHtml(session.chainName || 'Celo')}</span></div>
       <div class="meta-row"><span class="meta-label">Delivery</span><span class="meta-value">Philippines only</span></div>
       <div class="meta-row"><span class="meta-label">Status</span><span class="meta-value" id="checkout-live-status">pending</span></div>
     </section>
     ${
       !inMiniPay
-        ? `<section class="card"><div class="alert alert-warn">MiniPay wallet not detected. Open this checkout inside MiniPay to complete payment. No wallet calls are made in browser mode.</div></section>`
+        ? `<section class="card"><div class="alert alert-warn">Wallet signing is unavailable in a normal browser. Open inside MiniPay to complete payment.</div></section>`
         : `<section class="card"><div class="alert alert-info">MiniPay detected. Tap below to connect your wallet and confirm payment.</div><div class="meta-row" id="wallet-line" style="display:none"><span class="meta-label">Wallet</span><span class="meta-value" id="wallet-addr">—</span></div></section>`
     }
     <section class="card" id="payment-status-box" style="display:none"></section>
@@ -643,12 +1353,17 @@ function renderCheckout(main) {
     </div>
   `
 
-  document.getElementById('back-detail')?.addEventListener('click', () => setView('detail', { item }))
+  document.getElementById('back-checkout')?.addEventListener('click', () => setView('checkout'))
 
   const payBtn = document.getElementById('confirm-pay-btn')
   if (!inMiniPay || !payBtn) return
 
   payBtn.addEventListener('click', () => confirmMinipayPayment(session))
+}
+
+async function invokeVerify(body) {
+  const fn = cfg().verifyFunction || 'minipay-checkout-verify-payment'
+  return invokeFunction(fn, body)
 }
 
 async function confirmMinipayPayment(session) {
@@ -702,6 +1417,7 @@ async function confirmMinipayPayment(session) {
     }
 
     setView('paid', { session: { ...session, txHash: data.tx_hash, explorerUrl: data.explorer_url } })
+    clearCart()
   } catch (err) {
     statusBox.innerHTML = `<div class="alert alert-error">${escapeHtml(String(err.message ?? err))}</div>`
     payBtn.disabled = false
@@ -728,6 +1444,7 @@ function renderPaid(main) {
   document.getElementById('back-shop')?.addEventListener('click', () => {
     state.checkoutSession = null
     state.selectedItem = null
+    clearCart()
     setView('catalog')
   })
 }
@@ -745,15 +1462,22 @@ function diagnosticsHtml() {
     <section class="card diagnostics-card">
       <strong>Diagnostics</strong>
       <div class="diagnostics-row"><span>catalog source</span><span class="diagnostics-value">${escapeHtml(meta?.source || '—')}</span></div>
+      <div class="diagnostics-row"><span>catalog tab</span><span class="diagnostics-value">${escapeHtml(state.catalogTab)}</span></div>
+      <div class="diagnostics-row"><span>gear preview count</span><span class="diagnostics-value">${state.gearItems.length}</span></div>
+      <div class="diagnostics-row"><span>gear source</span><span class="diagnostics-value">digital-gear-preview.js (display only)</span></div>
+      <div class="diagnostics-row"><span>stock field</span><span class="diagnostics-value">${escapeHtml(String(meta?.stockField ?? 'stock_quantity'))}</span></div>
+      <div class="diagnostics-row"><span>availability field</span><span class="diagnostics-value">${escapeHtml(String(meta?.availabilityField ?? 'is_available'))}</span></div>
       <div class="diagnostics-row"><span>rows returned</span><span class="diagnostics-value">${meta?.rowCount ?? '—'}</span></div>
       <div class="diagnostics-row"><span>first row stock_quantity</span><span class="diagnostics-value">${escapeHtml(String(meta?.firstRowStock ?? '—'))}</span></div>
       <div class="diagnostics-row"><span>first row is_available</span><span class="diagnostics-value">${escapeHtml(String(meta?.firstRowAvailable ?? '—'))}</span></div>
+      <div class="diagnostics-row"><span>first product isSoldOut</span><span class="diagnostics-value">${escapeHtml(String(meta?.firstProductIsSoldOut ?? '—'))}</span></div>
       <div class="diagnostics-row"><span>demo mode</span><span class="diagnostics-value">${meta?.demoMode ? 'on' : 'off'}</span></div>
       <div class="diagnostics-row"><span>checkout path</span><span class="diagnostics-value">${escapeHtml(`${window.location.origin}${window.location.pathname}`)}</span></div>
       <div class="diagnostics-row"><span>provider status</span><span class="diagnostics-value">${providerStatusLabel()}</span></div>
       <div class="diagnostics-row"><span>has window.ethereum</span><span class="diagnostics-value">${window.ethereum ? 'yes' : 'no'}</span></div>
       <div class="diagnostics-row"><span>isMiniPay</span><span class="diagnostics-value">${state.isMiniPay ? 'yes' : 'no'}</span></div>
-      <div class="diagnostics-row"><span>session_id</span><span class="diagnostics-value">${state.checkoutSession?.sessionId ? 'present' : 'missing'}</span></div>
+      <div class="diagnostics-row"><span>cart items</span><span class="diagnostics-value">${getCartItemCount()}</span></div>
+      <div class="diagnostics-row"><span>view</span><span class="diagnostics-value">${escapeHtml(state.view)}</span></div>
       <div class="diagnostics-row"><span>token</span><span class="diagnostics-value">${state.checkoutSession?.sessionToken ? 'present' : 'missing'}</span></div>
     </section>
   `
@@ -765,13 +1489,20 @@ function render() {
 
   if (state.view === 'catalog') renderCatalog(main)
   else if (state.view === 'detail') renderDetail(main)
-  else if (state.view === 'checkout') renderCheckout(main)
+  else if (state.view === 'cart') renderCart(main)
+  else if (state.view === 'checkout') renderCheckoutForm(main)
+  else if (state.view === 'payment') renderPayment(main)
   else if (state.view === 'paid') renderPaid(main)
+  syncCartBadge()
 }
 
 function boot() {
   initHeaderUi()
+  loadCartFromStorage()
+  syncCartBadge()
   syncWalletDetection()
+  loadGearPreview()
+  syncSearchPlaceholder()
   loadCatalog()
 
   if (window.ethereum && typeof window.ethereum.on === 'function') {
@@ -843,15 +1574,15 @@ function closeModal() {
 function openMenuDrawer() {
   const drawer = document.getElementById('menu-drawer')
   if (!drawer) return
-  const homeUrl = cfgUrl('moveplusHomeUrl', 'https://amayatoken.online/moveplus')
-  const supportUrl = cfgUrl('supportUrl', 'https://amayatoken.online/moveplus/support')
+  const homeUrl = cfgUrl('moveplusHomeUrl', '')
+  const supportUrl = cfgUrl('supportUrl', 'https://')
   const appUrl = cfgUrl('moveplusAppDeepLink', homeUrl)
 
   drawer.innerHTML = `
     <div class="menu-drawer-header">
       <h2 class="menu-drawer-title">Menu</h2>
-      <button type="button" class="icon-button mp-icon-btn" id="menu-close" aria-label="Close menu">
-        <svg class="icon-button-svg mp-icon-svg" viewBox="0 0 24 24" aria-hidden="true" fill="none">
+      <button type="button" class="icon-button" id="menu-close" aria-label="Close menu">
+        <svg class="header-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
           <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
         </svg>
       </button>
@@ -931,7 +1662,7 @@ function closeMenuDrawer() {
 }
 
 function openTrackOrdersModal() {
-  const supportUrl = cfgUrl('supportUrl', 'https://')
+  const supportUrl = cfgUrl('supportUrl', 'https://amayatoken.online/moveplus/support')
   openModal({
     title: 'Track Orders',
     body: 'Order tracking will be available soon. For support, contact Move+.',
@@ -973,26 +1704,38 @@ function openFilterSheet() {
   if (!sheet) return
   state.ui.filterOpen = true
 
-  const sortOptions = [
-    ['featured', 'Featured'],
-    ['energy_low', 'Energy: low to high'],
-    ['energy_high', 'Energy: high to low'],
-    ['newest', 'Newest'],
-  ]
+  const isGear = state.catalogTab === 'gear'
+  const categories = getActiveCategories()
+  const sortOptions = isGear
+    ? [
+        ['featured', 'Featured'],
+        ['newest', 'Name A–Z'],
+      ]
+    : [
+        ['featured', 'Featured'],
+        ['energy_low', 'Energy: low to high'],
+        ['energy_high', 'Energy: high to low'],
+        ['newest', 'Newest'],
+      ]
 
   sheet.innerHTML = `
     <div class="sheet-handle" aria-hidden="true"></div>
-    <h2 class="sheet-title" id="filter-sheet-title">Filter products</h2>
+    <h2 class="sheet-title" id="filter-sheet-title">${isGear ? 'Filter digital gear' : 'Filter products'}</h2>
     <div class="filter-group">
       <span class="filter-label">Category</span>
       <div class="filter-options" id="filter-categories">
-        ${CATEGORIES.map(
-          (cat) =>
-            `<button type="button" class="filter-option ${state.selectedCategory === cat ? 'active' : ''}" data-cat="${escapeHtml(cat)}">${escapeHtml(cat)}</button>`,
-        ).join('')}
+        ${categories
+          .map(
+            (cat) =>
+              `<button type="button" class="filter-option ${state.selectedCategory === cat ? 'active' : ''}" data-cat="${escapeHtml(cat)}">${escapeHtml(cat)}</button>`,
+          )
+          .join('')}
       </div>
     </div>
-    <div class="filter-group">
+    ${
+      isGear
+        ? ''
+        : `<div class="filter-group">
       <span class="filter-label">Energy price range</span>
       <div class="filter-range">
         <input type="number" id="filter-energy-min" placeholder="Min EP" min="0" inputmode="numeric" value="${escapeHtml(state.filters.energyMin)}" />
@@ -1005,7 +1748,8 @@ function openFilterSheet() {
         <button type="button" class="filter-option ${state.filters.availability === 'all' ? 'active' : ''}" data-avail="all">All</button>
         <button type="button" class="filter-option ${state.filters.availability === 'available' ? 'active' : ''}" data-avail="available">Available only</button>
       </div>
-    </div>
+    </div>`
+    }
     <div class="filter-group">
       <span class="filter-label">Sort</span>
       <div class="filter-options" id="filter-sort">
@@ -1057,12 +1801,14 @@ function openFilterSheet() {
   document.getElementById('filter-apply')?.addEventListener('click', () => {
     const catBtn = sheet.querySelector('[data-cat].active')
     state.selectedCategory = catBtn?.getAttribute('data-cat') || 'All'
-    const availBtn = sheet.querySelector('[data-avail].active')
-    state.filters.availability = availBtn?.getAttribute('data-avail') || 'all'
+    if (!isGear) {
+      const availBtn = sheet.querySelector('[data-avail].active')
+      state.filters.availability = availBtn?.getAttribute('data-avail') || 'all'
+      state.filters.energyMin = document.getElementById('filter-energy-min')?.value?.trim() ?? ''
+      state.filters.energyMax = document.getElementById('filter-energy-max')?.value?.trim() ?? ''
+    }
     const sortBtn = sheet.querySelector('[data-sort].active')
     state.filters.sort = sortBtn?.getAttribute('data-sort') || 'featured'
-    state.filters.energyMin = document.getElementById('filter-energy-min')?.value?.trim() ?? ''
-    state.filters.energyMax = document.getElementById('filter-energy-max')?.value?.trim() ?? ''
     closeFilterSheet()
     if (state.view === 'catalog') render()
   })
@@ -1085,7 +1831,7 @@ function initHeaderUi() {
   const btnMenu = document.getElementById('btn-menu')
   const btnSearch = document.getElementById('btn-search')
   const btnFilter = document.getElementById('btn-filter')
-  const btnOrders = document.getElementById('btn-orders')
+  const btnCart = document.getElementById('btn-cart')
   const btnClear = document.getElementById('btn-search-clear')
   const searchInput = document.getElementById('search-input')
   const overlay = document.getElementById('ui-overlay')
@@ -1121,10 +1867,10 @@ function initHeaderUi() {
     openFilterSheet()
   })
 
-  btnOrders?.addEventListener('click', () => {
+  btnCart?.addEventListener('click', () => {
     closeMenuDrawer()
     closeFilterSheet()
-    openTrackOrdersModal()
+    setView('cart')
   })
 
   overlay?.addEventListener('click', () => {
