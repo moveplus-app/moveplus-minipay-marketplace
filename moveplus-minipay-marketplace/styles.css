@@ -128,6 +128,49 @@ h1 {
   border: 1px solid rgba(255, 255, 255, 0.06);
 }
 
+.btn-secondary {
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+
+.btn-secondary:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.helper-text {
+  margin: 0 0 12px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.instructions-card {
+  padding-top: 14px;
+}
+
+.instructions-title {
+  margin: 0 0 10px;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.instructions-list {
+  margin: 0 0 12px;
+  padding-left: 20px;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--text);
+}
+
+.instructions-list li + li {
+  margin-top: 6px;
+}
+
+.instructions-note {
+  margin: 0;
+  font-size: 12px;
+}
+
 .alert {
   border-radius: 12px;
   padding: 12px;
