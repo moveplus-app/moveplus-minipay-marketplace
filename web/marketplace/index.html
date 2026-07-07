@@ -9,7 +9,7 @@
     <meta name="theme-color" content="#242424" />
     <meta
       name="description"
-      content="Move+ Web Marketplace — real goods catalog, Philippines delivery, Energy and MiniPay checkout."
+      content="Move+ Web Marketplace — real goods catalog, Philippines delivery."
     />
     <title>Move+ Marketplace</title>
     <link rel="stylesheet" href="styles.css" />
@@ -17,21 +17,42 @@
   </head>
   <body>
     <div id="app" class="app" aria-live="polite">
-      <header class="header safe-top">
-        <div class="brand">
-          <div class="brand-mark" aria-hidden="true">M+</div>
-          <div>
-            <h1 class="brand-title">Move+ Marketplace</h1>
-            <p class="brand-subtitle">Philippines delivery only</p>
-          </div>
+      <header class="header mp-header safe-top">
+        <div class="header-left mp-header-left">
+          <button type="button" id="btn-menu" class="icon-button mp-icon-btn" aria-label="Menu" aria-expanded="false">
+            <svg class="icon-button-svg mp-icon-svg" viewBox="0 0 24 24" aria-hidden="true" fill="none">
+              <path d="M4 7h16M4 12h16M4 17h16" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+            </svg>
+          </button>
+          <h1 class="header-title mp-header-title">Marketplace</h1>
         </div>
-        <div id="wallet-pill" class="wallet-pill hidden" role="status"></div>
+        <div class="header-actions mp-header-actions">
+          <button type="button" id="btn-search" class="icon-button mp-icon-btn" aria-label="Search products">
+            <img src="assets/icons/search-broken-svgrepo-com.svg" alt="" class="icon-button-img mp-icon-img" width="24" height="24" />
+          </button>
+          <button type="button" id="btn-filter" class="icon-button mp-icon-btn" aria-label="Filter products">
+            <img src="assets/icons/filter-circle-svgrepo-com.svg" alt="" class="icon-button-img mp-icon-img" width="24" height="24" />
+          </button>
+          <button type="button" id="btn-orders" class="icon-button mp-icon-btn" aria-label="Orders">
+            <img src="assets/icons/order-svgrepo-com.svg" alt="" class="icon-button-img mp-icon-img" width="24" height="24" />
+          </button>
+        </div>
       </header>
 
-      <div class="notice-bar">
-        <span>Off-chain product · On-chain payment verification</span>
-        <span class="notice-sep">·</span>
-        <span>Energy Points are separate from crypto checkout.</span>
+      <div id="search-bar" class="search-bar hidden" role="search">
+        <input
+          id="search-input"
+          class="search-input"
+          type="search"
+          placeholder="Search products"
+          autocomplete="off"
+          enterkeyhint="search"
+        />
+        <button type="button" id="btn-search-clear" class="icon-button mp-icon-btn search-clear-btn" aria-label="Clear search">
+          <svg class="icon-button-svg mp-icon-svg" viewBox="0 0 24 24" aria-hidden="true" fill="none">
+            <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+          </svg>
+        </button>
       </div>
 
       <main id="main" class="main"></main>
@@ -40,6 +61,12 @@
         <p>Move+ Web Marketplace · Same catalog as the Move+ app</p>
       </footer>
     </div>
+
+    <div id="ui-overlay" class="ui-overlay hidden" aria-hidden="true"></div>
+    <nav id="menu-drawer" class="menu-drawer hidden" aria-label="Marketplace menu" aria-hidden="true"></nav>
+    <div id="filter-sheet" class="filter-sheet hidden" role="dialog" aria-modal="true" aria-labelledby="filter-sheet-title" aria-hidden="true"></div>
+    <div id="mp-modal" class="mp-modal hidden" role="dialog" aria-modal="true" aria-hidden="true"></div>
+
     <script src="app.js" defer></script>
   </body>
 </html>
