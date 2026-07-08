@@ -12,6 +12,13 @@ import {
   normalizeEvmAddress,
   sha256Hex,
 } from './minipay_celo.ts'
+import {
+  getMarketplacePaymentsContractAddress,
+  hashMarketplaceOrderId,
+  isMarketplaceOrderPaidOnChain,
+  loadMarketplacePaymentsSignerConfig,
+  recordMarketplacePaymentReceipt,
+} from './marketplace_payments_contract.ts'
 import { safeError, safeLog, shortAddress } from './log_sanitize.ts'
 import {
   enforceRateLimits,
@@ -63,6 +70,11 @@ type SessionRow = {
   cart_items: Array<Record<string, unknown>> | null
   total_quantity: number | null
   energy_points_total: number | null
+  receipt_contract_address: string | null
+  receipt_tx_hash: string | null
+  receipt_recorded_at: string | null
+  receipt_order_hash: string | null
+  receipt_pending: boolean | null
 }
 
 type CartItemSnapshot = {
@@ -156,7 +168,18 @@ function paidPayload(
   session: SessionRow,
   itemTitle: string,
   purchaseId: string | null,
+  celoExplorerBase?: string,
+  receiptMeta?: {
+    receipt_pending?: boolean
+    receipt_explorer_url?: string | null
+  },
 ) {
+  const receiptExplorer =
+    receiptMeta?.receipt_explorer_url ??
+    (session.receipt_tx_hash && celoExplorerBase
+      ? `${celoExplorerBase}${session.receipt_tx_hash}`
+      : null)
+
   return {
     success: true,
     status: 'paid',
@@ -170,6 +193,126 @@ function paidPayload(
     purchase_id: purchaseId,
     order_status: 'pending',
     delivery_region: 'Philippines only',
+    receipt_contract_address: session.receipt_contract_address ?? null,
+    receipt_tx_hash: session.receipt_tx_hash ?? null,
+    receipt_order_hash: session.receipt_order_hash ?? null,
+    receipt_recorded_at: session.receipt_recorded_at ?? null,
+    receipt_recorded: Boolean(session.receipt_tx_hash),
+    receipt_pending: receiptMeta?.receipt_pending === true ||
+      (session.receipt_pending === true && !session.receipt_tx_hash),
+    receipt_explorer_url: receiptExplorer,
+  }
+}
+
+async function persistReceiptFields(
+  admin: ReturnType<typeof createClient>,
+  sessionId: string,
+  fields: {
+    receipt_contract_address?: string | null
+    receipt_tx_hash?: string | null
+    receipt_order_hash?: string
+    receipt_recorded_at?: string
+    receipt_pending?: boolean
+  },
+) {
+  const update: Record<string, string | boolean | null> = {}
+
+  if (fields.receipt_contract_address !== undefined) {
+    update.receipt_contract_address = fields.receipt_contract_address
+  }
+  if (fields.receipt_order_hash !== undefined) {
+    update.receipt_order_hash = fields.receipt_order_hash
+  }
+  if (fields.receipt_pending !== undefined) {
+    update.receipt_pending = fields.receipt_pending
+  }
+  if (fields.receipt_tx_hash) {
+    update.receipt_tx_hash = fields.receipt_tx_hash
+    update.receipt_recorded_at = fields.receipt_recorded_at ?? new Date().toISOString()
+    update.receipt_pending = false
+  }
+
+  if (Object.keys(update).length === 0) return
+
+  const { error } = await admin
+    .from('marketplace_minipay_sessions')
+    .update(update)
+    .eq('id', sessionId)
+    .is('receipt_tx_hash', null)
+
+  if (error) {
+    safeError('minipay_receipt_db_update_failed', { message: error.message })
+  }
+}
+
+/**
+ * Attach receipt metadata after payment is already marked paid.
+ * Does not block checkout success; on-chain recordDirectPayment is manual (Trezor owner).
+ */
+async function prepareReceiptMetadata(
+  admin: ReturnType<typeof createClient>,
+  session: SessionRow,
+  paymentTxHash: string,
+  payerWallet: string,
+  amountRaw: bigint,
+): Promise<{
+  session: SessionRow
+  receiptPending: boolean
+}> {
+  if (session.receipt_tx_hash) {
+    return { session, receiptPending: false }
+  }
+
+  const contractAddress = getMarketplacePaymentsContractAddress()
+  const orderIdHash = session.receipt_order_hash ?? hashMarketplaceOrderId(session.id)
+
+  let receiptPending = true
+  let receiptTxHash: string | null = null
+  let receiptRecordedAt: string | undefined
+
+  const alreadyPaidOnChain = await isMarketplaceOrderPaidOnChain(session.id)
+  if (alreadyPaidOnChain) {
+    receiptPending = false
+  }
+
+  const signerConfig = loadMarketplacePaymentsSignerConfig()
+  if (signerConfig && !alreadyPaidOnChain) {
+    const result = await recordMarketplacePaymentReceipt({
+      sessionId: session.id,
+      payerAddress: payerWallet,
+      tokenAddress: session.token_address,
+      amountRaw,
+      paymentTxHash,
+    })
+
+    if (result.recorded || result.alreadyPaidOnChain) {
+      receiptPending = false
+      receiptTxHash = result.receiptTxHash
+      receiptRecordedAt = new Date().toISOString()
+    }
+  }
+
+  await persistReceiptFields(admin, session.id, {
+    receipt_contract_address: contractAddress,
+    receipt_order_hash: orderIdHash,
+    receipt_tx_hash: receiptTxHash,
+    receipt_recorded_at: receiptRecordedAt,
+    receipt_pending: receiptPending,
+  })
+
+  const refreshed = await loadSession(admin, session.id)
+  const merged = refreshed ?? {
+    ...session,
+    receipt_contract_address: contractAddress,
+    receipt_order_hash: orderIdHash,
+    receipt_tx_hash: receiptTxHash,
+    receipt_recorded_at: receiptRecordedAt ?? null,
+    receipt_pending: receiptPending,
+  }
+
+  return {
+    session: merged,
+    receiptPending: receiptPending && !merged.receipt_tx_hash,
   }
 }
 
@@ -246,7 +389,39 @@ serve(async (req) => {
           status: 'paid',
         }, 409)
       }
-      return json(paidPayload(session, itemTitle, session.purchase_id), 200)
+
+      let celoConfigForReceipt
+      try {
+        celoConfigForReceipt = loadMinipayCeloConfig()
+      } catch {
+        celoConfigForReceipt = null
+      }
+
+      const paidTx = session.tx_hash ?? txHashRaw
+      const paidPayer = session.payer_wallet_address ?? payerWallet
+      const receipt = paidTx && paidPayer
+        ? await prepareReceiptMetadata(
+          admin,
+          session,
+          paidTx,
+          paidPayer,
+          BigInt(session.crypto_amount_raw),
+        )
+        : {
+          session,
+          receiptPending: session.receipt_pending === true || !session.receipt_tx_hash,
+        }
+
+      return json(
+        paidPayload(
+          receipt.session,
+          itemTitle,
+          session.purchase_id,
+          celoConfigForReceipt?.explorerBaseUrl,
+          { receipt_pending: receipt.receiptPending },
+        ),
+        200,
+      )
     }
 
     if (sessionExpired(session) && session.status !== 'paid') {
@@ -515,17 +690,29 @@ serve(async (req) => {
       tx_prefix: txHashRaw.slice(0, 10),
     })
 
+    const paidSession: SessionRow = {
+      ...workingSession,
+      tx_hash: txHashRaw,
+      payer_wallet_address: payerWallet,
+      status: 'paid',
+      purchase_id: purchaseId,
+    }
+
+    const receipt = await prepareReceiptMetadata(
+      admin,
+      paidSession,
+      txHashRaw,
+      payerWallet,
+      transfer.amount,
+    )
+
     return json({
       ...paidPayload(
-        {
-          ...workingSession,
-          tx_hash: txHashRaw,
-          payer_wallet_address: payerWallet,
-          status: 'paid',
-          purchase_id: purchaseId,
-        },
+        receipt.session,
         itemTitle,
         purchaseId,
+        celoConfig.explorerBaseUrl,
+        { receipt_pending: receipt.receiptPending },
       ),
       explorer_url: `${celoConfig.explorerBaseUrl}${txHashRaw}`,
     }, 200)
