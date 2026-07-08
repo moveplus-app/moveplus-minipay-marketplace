@@ -48,7 +48,7 @@ const state = {
 }
 
 function cfg() {
-  return window.MOVEPLUS_MARKETPLACE_CONFIG || {}
+  return window.MP_MARKETPLACE_CONFIG || window.MOVEPLUS_MARKETPLACE_CONFIG || {}
 }
 
 function qs(name) {
@@ -67,6 +67,24 @@ function logDebug(...args) {
 function isDemoMode() {
   const c = cfg()
   return c.demoMode === true || c.DEMO_MODE === true
+}
+
+function isDigitalGearEnabled() {
+  const c = cfg()
+  const flag = c.showDigitalGear ?? c.SHOW_DIGITAL_GEAR
+  return flag === true || flag === 'true' || flag === 1 || flag === '1'
+}
+
+function forceRealCatalogIfGearHidden() {
+  if (isDigitalGearEnabled()) return
+  if (state.catalogTab !== 'real') {
+    state.catalogTab = 'real'
+    state.selectedCategory = 'All'
+  }
+  if (state.view === 'detail' && isDigitalGear(state.selectedItem)) {
+    state.selectedItem = null
+    state.view = 'catalog'
+  }
 }
 
 function isMiniPayWallet() {
@@ -212,7 +230,7 @@ function formatProductCryptoLabel(product) {
   if (!product || product.cryptoPrice == null) return null
   const amount = Number(product.cryptoPrice)
   if (!Number.isFinite(amount) || amount <= 0) return null
-  const symbol = product.cryptoSymbol || ''
+  const symbol = product.cryptoSymbol || cfg().cryptoTokenSymbol || 'cUSD'
   return `${formatMoneyAmount(amount)} ${symbol}`
 }
 
@@ -248,8 +266,8 @@ function sumCartCryptoTotals(lines) {
     return { display: '—', tokenSymbol: null, hasPrice: false }
   }
   return {
-    display: `${formatMoneyAmount(total)} ${tokenSymbol || ''}`,
-    tokenSymbol: tokenSymbol || '',
+    display: `${formatMoneyAmount(total)} ${tokenSymbol || cfg().cryptoTokenSymbol || 'cUSD'}`,
+    tokenSymbol: tokenSymbol || cfg().cryptoTokenSymbol || 'cUSD',
     hasPrice: true,
   }
 }
@@ -543,6 +561,7 @@ function bindGearImageFallbacks(root) {
 }
 
 function marketplaceToggleHtml() {
+  if (!isDigitalGearEnabled()) return ''
   return `
     <div class="marketplace-type-toggle" role="tablist" aria-label="Marketplace type">
       <button type="button" class="marketplace-type-btn ${state.catalogTab === 'real' ? 'active' : ''}" data-catalog-tab="real" role="tab" aria-selected="${state.catalogTab === 'real'}">Real Items</button>
@@ -552,6 +571,9 @@ function marketplaceToggleHtml() {
 }
 
 function setCatalogTab(tab) {
+  if (!isDigitalGearEnabled() && tab === 'gear') {
+    tab = 'real'
+  }
   if (tab !== 'real' && tab !== 'gear') return
   if (state.catalogTab === tab) return
   state.catalogTab = tab
@@ -569,7 +591,10 @@ function setCatalogTab(tab) {
 function syncSearchPlaceholder() {
   const input = document.getElementById('search-input')
   if (!input) return
-  input.placeholder = state.catalogTab === 'gear' ? 'Search digital gear' : 'Search products'
+  input.placeholder =
+    isDigitalGearEnabled() && state.catalogTab === 'gear'
+      ? 'Search digital gear'
+      : 'Search products'
 }
 
 function bindCatalogTabHandlers(root) {
@@ -672,7 +697,7 @@ function demoProducts() {
       image_url: null,
       energy_points_price: 1200,
       crypto_price: 1.0,
-      crypto_currency: 'USDC',
+      crypto_currency: 'cUSD',
       category: 'Apparel',
       stock_quantity: 5,
       is_available: true,
@@ -811,7 +836,7 @@ function filteredGearItems() {
 }
 
 function hasActiveFilters() {
-  if (state.catalogTab === 'gear') {
+  if (isDigitalGearEnabled() && state.catalogTab === 'gear') {
     return state.selectedCategory !== 'All' || state.filters.sort !== 'featured'
   }
   return (
@@ -823,6 +848,7 @@ function hasActiveFilters() {
 }
 
 function setView(view, payload = {}) {
+  forceRealCatalogIfGearHidden()
   if (view === 'payment' && !state.checkoutSession) {
     view = state.cart.length > 0 ? 'checkout' : 'catalog'
   }
@@ -897,9 +923,10 @@ function gearCardHtml(gear) {
 }
 
 function renderCatalog(main) {
+  forceRealCatalogIfGearHidden()
   const toggle = marketplaceToggleHtml()
 
-  if (state.catalogTab === 'gear') {
+  if (isDigitalGearEnabled() && state.catalogTab === 'gear') {
     const items = filteredGearItems()
     const categories = getGearCategories()
     const chips = categories
@@ -916,6 +943,10 @@ function renderCatalog(main) {
 
     main.innerHTML = `
       ${toggle}
+      <section class="card">
+        <div class="alert alert-info">Digital gear is preview-only for now. Purchases and management happen inside Move+.</div>
+        <p class="detail-desc" style="margin-top:8px">MiniPay checkout currently applies to Real Items only.</p>
+      </section>
       <div class="chips" role="tablist">${chips}</div>
       ${
         items.length === 0
@@ -1029,7 +1060,8 @@ function renderGearDetail(main) {
       }
     </section>
     <section class="card">
-      <div class="alert alert-info">Digital gear purchase and management are available inside Move+.</div>
+      <div class="alert alert-info">Digital gear is preview-only for now. Purchases and management happen inside Move+.</div>
+      <p class="detail-desc" style="margin-top:8px">MiniPay checkout currently applies to Real Items only.</p>
     </section>
     ${diagnosticsHtml()}
     <div class="action-bar" id="gear-detail-actions">
@@ -1047,6 +1079,7 @@ function renderGearDetail(main) {
 }
 
 function renderDetail(main) {
+  forceRealCatalogIfGearHidden()
   const product = state.selectedItem
   if (!product) {
     setView('catalog')
@@ -1491,7 +1524,7 @@ function renderPaid(main) {
         hasReceipt
           ? `<p class="detail-desc">Receipt recorded on Celo. Your order is pending fulfillment.</p>`
           : receiptPending
-            ? `<p class="detail-desc">Payment verified. On-chain receipt is pending — your order is confirmed and awaiting fulfillment.</p>`
+            ? `<p class="detail-desc">Payment verified. On-chain receipt is pending — your order is still being processed.</p>`
             : `<p class="detail-desc">Your order is pending fulfillment. Thank you for shopping with Move+.</p>`
       }
       <div class="meta-row"><span class="meta-label">Product</span><span class="meta-value">${escapeHtml(session?.itemTitle || '—')}</span></div>
@@ -1508,7 +1541,7 @@ function renderPaid(main) {
       }
       ${
         receiptPending && !hasReceipt
-          ? `<div class="alert alert-info" style="margin-top:12px">On-chain receipt may be recorded later by Move+. No action needed from you.</div>`
+          ? `<div class="alert alert-info" style="margin-top:12px">On-chain receipt will be recorded shortly. No action needed.</div>`
           : ''
       }
     </section>
@@ -1575,7 +1608,13 @@ function boot() {
   loadCartFromStorage()
   syncCartBadge()
   syncWalletDetection()
-  loadGearPreview()
+  if (isDigitalGearEnabled()) {
+    loadGearPreview()
+  } else {
+    state.gearItems = []
+    state.catalogTab = 'real'
+    state.selectedCategory = 'All'
+  }
   syncSearchPlaceholder()
   loadCatalog()
 
