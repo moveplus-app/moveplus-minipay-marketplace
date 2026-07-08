@@ -13,10 +13,11 @@ const CATEGORIES = [
   'Vouchers',
 ]
 
-const GEAR_CATEGORY_ORDER = ['All', 'Ronin', 'Base', 'Runner', 'Cycling', 'Founder']
+const GEAR_CATEGORY_ORDER = ['All', 'Ronin', 'Base', 'Genesis', 'Shoebox', 'Founder', 'Cycling']
+const GEAR_PLACEHOLDER_PATH = './assets/gear/gear_placeholder.png'
 
 const ERC20_TRANSFER_SELECTOR = '0xa9059cbb'
-const CART_STORAGE_KEY = ''
+const CART_STORAGE_KEY = 'moveplus_web_marketplace_cart_v1'
 
 const state = {
   view: 'catalog',
@@ -114,8 +115,7 @@ function readBoolField(value, defaultWhenNull = false) {
 
 /**
  * Map Supabase marketplace_items row to web catalog product.
- * Matches native SupabaseService.getMarketplaceItems() + MarketplaceItemModel.
- * Native availability uses is_available (admin "In Stock"), not stock_quantity.
+ * stock_quantity: null = untracked, 0 = sold out, >0 = capped quantity.
  */
 function normalizeMarketplaceProduct(row) {
   const stockRaw = row.stock_quantity
@@ -130,7 +130,6 @@ function normalizeMarketplaceProduct(row) {
   const isAvailableFlag = readBoolField(row.is_available, true)
   const isAvailable = isAvailableFlag && !isDeleted
 
-  // Native Move+ uses is_available; stock_quantity=0 is sold out for web/MiniPay checkout.
   const isSoldOut = !isAvailable || (stock !== null && stock === 0)
 
   const cryptoPriceRaw = row.crypto_price
@@ -213,7 +212,7 @@ function formatProductCryptoLabel(product) {
   if (!product || product.cryptoPrice == null) return null
   const amount = Number(product.cryptoPrice)
   if (!Number.isFinite(amount) || amount <= 0) return null
-  const symbol = product.cryptoSymbol || 'cUSD'
+  const symbol = product.cryptoSymbol || ''
   return `${formatMoneyAmount(amount)} ${symbol}`
 }
 
@@ -249,8 +248,8 @@ function sumCartCryptoTotals(lines) {
     return { display: '—', tokenSymbol: null, hasPrice: false }
   }
   return {
-    display: `${formatMoneyAmount(total)} ${tokenSymbol || 'cUSD'}`,
-    tokenSymbol: tokenSymbol || 'cUSD',
+    display: `${formatMoneyAmount(total)} ${tokenSymbol || ''}`,
+    tokenSymbol: tokenSymbol || '',
     hasPrice: true,
   }
 }
@@ -478,15 +477,18 @@ function loadGearPreview() {
     ? rows.map((row) => ({
         ...row,
         id: String(row.id ?? ''),
+        imageUrl: row.imageUrl || GEAR_PLACEHOLDER_PATH,
+        fallbackImageUrl: row.fallbackImageUrl || row.imageUrl || GEAR_PLACEHOLDER_PATH,
+        cidImageUrl: row.cidImageUrl ?? null,
       }))
     : []
 }
 
 function getGearCategories() {
-  const cats = new Set(['All'])
+  const cats = new Set(['All', 'Cycling'])
   for (const gear of state.gearItems) {
     if (gear.filterChain) cats.add(gear.filterChain)
-    if (gear.filterType) cats.add(gear.filterType)
+    if (gear.filterCategory) cats.add(gear.filterCategory)
   }
   return GEAR_CATEGORY_ORDER.filter((cat) => cats.has(cat))
 }
@@ -497,7 +499,47 @@ function getActiveCategories() {
 
 function matchesGearCategory(gear, category) {
   if (category === 'All') return true
-  return gear.filterChain === category || gear.filterType === category || gear.category === category
+  if (category === 'Cycling') return false
+  return (
+    gear.filterChain === category ||
+    gear.filterCategory === category ||
+    gear.category === category
+  )
+}
+
+function gearImageBlock(gear, { detail = false } = {}) {
+  const primary = gear.imageUrl || GEAR_PLACEHOLDER_PATH
+  const fallback = gear.fallbackImageUrl || GEAR_PLACEHOLDER_PATH
+  const imgClass = detail ? 'gear-image detail-hero-img' : 'product-image gear-image'
+  return `
+    <img
+      class="${imgClass}"
+      src="${escapeHtml(primary)}"
+      data-fallback="${escapeHtml(fallback)}"
+      alt=""
+      loading="lazy"
+    />
+    <div class="gear-image-fallback hidden" aria-hidden="true">Preview</div>
+  `
+}
+
+function bindGearImageFallbacks(root) {
+  root.querySelectorAll('img.gear-image').forEach((img) => {
+    if (img.dataset.gearBound) return
+    img.dataset.gearBound = '1'
+    img.addEventListener('error', () => {
+      const fallback = img.getAttribute('data-fallback') || GEAR_PLACEHOLDER_PATH
+      if (!img.dataset.triedFallback && fallback) {
+        img.dataset.triedFallback = '1'
+        img.src = fallback
+        return
+      }
+      img.classList.add('gear-image--failed')
+      const wrap = img.closest('.product-image-wrap, .detail-hero')
+      const block = wrap?.querySelector('.gear-image-fallback')
+      if (block) block.classList.remove('hidden')
+    })
+  })
 }
 
 function marketplaceToggleHtml() {
@@ -630,7 +672,7 @@ function demoProducts() {
       image_url: null,
       energy_points_price: 1200,
       crypto_price: 1.0,
-      crypto_currency: 'cUSD',
+      crypto_currency: 'USDC',
       category: 'Apparel',
       stock_quantity: 5,
       is_available: true,
@@ -756,7 +798,7 @@ function filteredGearItems() {
   const q = state.ui.searchQuery.trim().toLowerCase()
   if (q) {
     items = items.filter((gear) => {
-      const hay = `${gear.title} ${gear.description} ${gear.chain} ${gear.gearType} ${gear.rarity} ${gear.category}`.toLowerCase()
+      const hay = `${gear.title} ${gear.description} ${gear.chain} ${gear.gearType} ${gear.rarity} ${gear.category} ${gear.filterCategory || ''}`.toLowerCase()
       return hay.includes(q)
     })
   }
@@ -827,12 +869,8 @@ function productCardHtml(product) {
 }
 
 function gearCardHtml(gear) {
-  const img = gear.imageUrl
-  const imageBlock = img
-    ? `<img class="product-image" src="${escapeHtml(img)}" alt="" loading="lazy" />`
-    : `<div class="product-image placeholder">Preview</div>`
-
   const stats = []
+  if (gear.supplyNote) stats.push(gear.supplyNote)
   if (gear.dailyCap && gear.dailyCap !== '—') stats.push(`Daily cap: ${gear.dailyCap}`)
   if (gear.multiplier && gear.multiplier !== '—') stats.push(`${gear.multiplier}`)
   if (gear.repairDiscount && gear.repairDiscount !== '—' && stats.length < 2) {
@@ -842,7 +880,7 @@ function gearCardHtml(gear) {
   return `
     <button type="button" class="product-card gear-card" data-gear-id="${escapeHtml(gear.id)}">
       <div class="product-image-wrap">
-        ${imageBlock}
+        ${gearImageBlock(gear)}
       </div>
       <div class="product-body">
         <div class="gear-badge-row">
@@ -871,12 +909,17 @@ function renderCatalog(main) {
       )
       .join('')
 
+    const gearEmptyMessage =
+      state.selectedCategory === 'Cycling'
+        ? 'Cycling gear is coming soon.'
+        : 'No digital gear in this category.'
+
     main.innerHTML = `
       ${toggle}
       <div class="chips" role="tablist">${chips}</div>
       ${
         items.length === 0
-          ? `<section class="card empty"><p>No digital gear in this category.</p></section>`
+          ? `<section class="card empty"><p>${escapeHtml(gearEmptyMessage)}</p></section>`
           : `<div class="grid" id="gear-grid">${items.map(gearCardHtml).join('')}</div>`
       }
       ${diagnosticsHtml()}
@@ -884,6 +927,7 @@ function renderCatalog(main) {
 
     bindCatalogTabHandlers(main)
     bindCategoryChipHandlers(main)
+    bindGearImageFallbacks(main)
     main.querySelectorAll('[data-gear-id]').forEach((btn) => {
       btn.addEventListener('click', () => {
         const id = btn.getAttribute('data-gear-id')
@@ -957,17 +1001,12 @@ function renderGearDetail(main) {
     return
   }
 
-  const img = gear.imageUrl
-  const appUrl = cfg().moveplusAppDeepLink || cfg().moveplusHomeUrl || 'https://'
+  const appUrl = cfg().moveplusAppDeepLink || cfg().moveplusHomeUrl || 'https://amayatoken.online/moveplus/'
 
   main.innerHTML = `
     <button type="button" class="btn btn-ghost" id="back-catalog">← Back to catalog</button>
     <div class="detail-hero">
-      ${
-        img
-          ? `<img src="${escapeHtml(img)}" alt="" />`
-          : `<div class="product-image placeholder" style="height:100%">Preview</div>`
-      }
+      ${gearImageBlock(gear, { detail: true })}
     </div>
     <section class="card">
       <div class="gear-badge-row" style="margin-bottom:10px">
@@ -983,17 +1022,23 @@ function renderGearDetail(main) {
       <div class="meta-row"><span class="meta-label">Daily cap</span><span class="meta-value">${escapeHtml(gear.dailyCap || '—')}</span></div>
       <div class="meta-row"><span class="meta-label">Multiplier</span><span class="meta-value">${escapeHtml(gear.multiplier || '—')}</span></div>
       <div class="meta-row"><span class="meta-label">Repair</span><span class="meta-value">${escapeHtml(gear.repairDiscount || '—')}</span></div>
+      ${
+        gear.supplyNote
+          ? `<div class="meta-row"><span class="meta-label">Supply</span><span class="meta-value">${escapeHtml(gear.supplyNote)}</span></div>`
+          : ''
+      }
     </section>
     <section class="card">
-      <div class="alert alert-info">Digital gear purchase is available inside Move+.</div>
+      <div class="alert alert-info">Digital gear purchase and management are available inside Move+.</div>
     </section>
     ${diagnosticsHtml()}
     <div class="action-bar" id="gear-detail-actions">
       <button type="button" class="btn btn-primary" id="open-moveplus-app">Open Move+ App</button>
-      <button type="button" class="btn btn-secondary" id="view-gear-back">View Gear</button>
+      <button type="button" class="btn btn-secondary" id="view-gear-back">Back to Gear</button>
     </div>
   `
 
+  bindGearImageFallbacks(main)
   document.getElementById('back-catalog')?.addEventListener('click', () => setView('catalog'))
   document.getElementById('view-gear-back')?.addEventListener('click', () => setView('catalog'))
   document.getElementById('open-moveplus-app')?.addEventListener('click', () => {
@@ -1200,7 +1245,7 @@ function renderCheckoutForm(main) {
 
   const minipayEnabled = cfg().enableMiniPayCheckout !== false
   const inMiniPay = isMiniPayWallet()
-  const appUrl = cfg().moveplusAppDeepLink || cfg().moveplusHomeUrl || 'https://'
+  const appUrl = cfg().moveplusAppDeepLink || cfg().moveplusHomeUrl || 'https://amayatoken.online/moveplus/'
   const minipayReady = minipayEnabled && inMiniPay && totals.hasCryptoPrices
   const minipayBlockedReason = !totals.hasCryptoPrices
     ? 'Set crypto prices in Admin Dashboard before MiniPay checkout.'
@@ -1416,7 +1461,17 @@ async function confirmMinipayPayment(session) {
       throw new Error(friendlyApiError(status, data))
     }
 
-    setView('paid', { session: { ...session, txHash: data.tx_hash, explorerUrl: data.explorer_url } })
+    setView('paid', {
+      session: {
+        ...session,
+        txHash: data.tx_hash,
+        explorerUrl: data.explorer_url,
+        receiptTxHash: data.receipt_tx_hash ?? null,
+        receiptExplorerUrl: data.receipt_explorer_url ?? null,
+        receiptPending: data.receipt_pending === true,
+        receiptRecorded: data.receipt_recorded === true || Boolean(data.receipt_tx_hash),
+      },
+    })
     clearCart()
   } catch (err) {
     statusBox.innerHTML = `<div class="alert alert-error">${escapeHtml(String(err.message ?? err))}</div>`
@@ -1426,15 +1481,34 @@ async function confirmMinipayPayment(session) {
 
 function renderPaid(main) {
   const session = state.checkoutSession
+  const receiptPending = session?.receiptPending === true
+  const hasReceipt = Boolean(session?.receiptTxHash)
+
   main.innerHTML = `
     <section class="card">
       <h2 class="detail-title" style="font-size:17px;color:var(--accent)">Payment verified</h2>
-      <p class="detail-desc">Your order is pending fulfillment. Thank you for shopping with Move+.</p>
+      ${
+        hasReceipt
+          ? `<p class="detail-desc">Receipt recorded on Celo. Your order is pending fulfillment.</p>`
+          : receiptPending
+            ? `<p class="detail-desc">Payment verified. On-chain receipt is pending — your order is confirmed and awaiting fulfillment.</p>`
+            : `<p class="detail-desc">Your order is pending fulfillment. Thank you for shopping with Move+.</p>`
+      }
       <div class="meta-row"><span class="meta-label">Product</span><span class="meta-value">${escapeHtml(session?.itemTitle || '—')}</span></div>
       <div class="meta-row"><span class="meta-label">Amount</span><span class="meta-value">${escapeHtml(session?.amountDisplay || '—')} ${escapeHtml(session?.tokenSymbol || '')}</span></div>
       ${
         session?.txHash
-          ? `<div class="meta-row"><span class="meta-label">Tx</span><span class="meta-value">${session.explorerUrl ? `<a class="tx-link" href="${escapeHtml(session.explorerUrl)}" target="_blank" rel="noopener">${shortAddr(session.txHash)}</a>` : shortAddr(session.txHash)}</span></div>`
+          ? `<div class="meta-row"><span class="meta-label">Payment tx</span><span class="meta-value">${session.explorerUrl ? `<a class="tx-link" href="${escapeHtml(session.explorerUrl)}" target="_blank" rel="noopener">${shortAddr(session.txHash)}</a>` : shortAddr(session.txHash)}</span></div>`
+          : ''
+      }
+      ${
+        hasReceipt
+          ? `<div class="meta-row"><span class="meta-label">Receipt tx</span><span class="meta-value">${session.receiptExplorerUrl ? `<a class="tx-link" href="${escapeHtml(session.receiptExplorerUrl)}" target="_blank" rel="noopener">${shortAddr(session.receiptTxHash)}</a>` : shortAddr(session.receiptTxHash)}</span></div>`
+          : ''
+      }
+      ${
+        receiptPending && !hasReceipt
+          ? `<div class="alert alert-info" style="margin-top:12px">On-chain receipt may be recorded later by Move+. No action needed from you.</div>`
           : ''
       }
     </section>
@@ -1574,8 +1648,8 @@ function closeModal() {
 function openMenuDrawer() {
   const drawer = document.getElementById('menu-drawer')
   if (!drawer) return
-  const homeUrl = cfgUrl('moveplusHomeUrl', '')
-  const supportUrl = cfgUrl('supportUrl', 'https://')
+  const homeUrl = cfgUrl('moveplusHomeUrl', 'https://amayatoken.online/moveplus')
+  const supportUrl = cfgUrl('supportUrl', 'https://amayatoken.online/moveplus/support')
   const appUrl = cfgUrl('moveplusAppDeepLink', homeUrl)
 
   drawer.innerHTML = `
