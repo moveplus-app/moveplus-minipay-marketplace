@@ -1,4 +1,8 @@
 # Move+ MiniPay Marketplace
+   - MiniPay submission
+   - marketplace URL
+   - Celo contract address
+   - cUSD token address
 
 Move+ is a gamified fitness app where users walk, run, and cycle to earn Energy rewards.
 
@@ -22,7 +26,6 @@ Users earn off-chain Energy through movement, redeem Energy for marketplace rewa
 8. Order is marked paid and pending fulfillment
 
 ## MiniPay Checkout Flow
-
 
 Move+ Marketplace
 → Choose Payment Method
