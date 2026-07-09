@@ -17,7 +17,11 @@ import 'marketplace_item_detail_screen.dart';
 /// Production Move+ keeps product catalog, Energy, and delivery off-chain.
 /// MiniPay/Celo checkout will be added as a separate crypto payment path.
 
-
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:google_fonts/google_fonts.dart';
+import 'package:go_router/go_router.dart';
+import 'marketplace_item_detail_screen.dart';
 
 class MarketplaceCheckoutScreen extends ConsumerStatefulWidget {
   final MarketplaceTileData? itemData;
@@ -265,7 +269,9 @@ class _MarketplaceCheckoutScreenState extends ConsumerState<MarketplaceCheckoutS
                         if (!hasEnoughEnergy) ...[
                           const SizedBox(height: 8),
                           Text(
-                            'Not enough Energy Points. You can earn more Energy or use MiniPay when available.',
+                            AppConfig.enableCeloCheckout
+                                ? 'Not enough Energy Points. You can earn more Energy or use MiniPay when available.'
+                                : 'Not enough Energy Points. You can earn more Energy by completing activities.',
                             style: GoogleFonts.inter(
                               color: Colors.orange.shade300,
                               fontSize: 11,
@@ -276,31 +282,22 @@ class _MarketplaceCheckoutScreenState extends ConsumerState<MarketplaceCheckoutS
                         if (AppConfig.enableCeloCheckout) ...[
                           const SizedBox(height: 12),
                           _buildPaymentOptionCard(
-                            title: 'Pay with MiniPay',
-                            description:
-                                'Pay with supported stablecoin on Celo via MiniPay.',
-                            subtitle: AppConfig.enableMiniPayProductionCheckout
+                            title: AppConfig.isNativeMinipayCheckoutEnabled
+                                ? 'Continue to MiniPay'
+                                : 'MiniPay checkout',
+                            description: AppConfig.isNativeMinipayCheckoutEnabled
+                                ? 'Pay with supported stablecoin on Celo via MiniPay.'
+                                : 'MiniPay payments will be available after Move+ Marketplace Mini App approval.',
+                            subtitle: AppConfig.isNativeMinipayCheckoutEnabled
                                 ? 'Celo stablecoin · Philippines delivery'
-                                : 'Coming soon',
-                            enabled: true,
-                            onTap: () {
-                              Navigator.of(sheetContext).pop();
-                              if (AppConfig.enableMiniPayProductionCheckout) {
-                                _handleMinipayCheckout(item);
-                              } else {
-                                ScaffoldMessenger.of(context).showSnackBar(
-                                  SnackBar(
-                                    content: Text(
-                                      'MiniPay checkout is coming soon.',
-                                      style: GoogleFonts.inter(fontSize: 14),
-                                    ),
-                                    backgroundColor: AppTheme.placeholderColor,
-                                    behavior: SnackBarBehavior.floating,
-                                    duration: const Duration(seconds: 3),
-                                  ),
-                                );
-                              }
-                            },
+                                : 'Coming soon after MiniPay marketplace approval.',
+                            enabled: AppConfig.isNativeMinipayCheckoutEnabled,
+                            onTap: AppConfig.isNativeMinipayCheckoutEnabled
+                                ? () {
+                                    Navigator.of(sheetContext).pop();
+                                    _handleMinipayCheckout(item);
+                                  }
+                                : null,
                           ),
                         ],
                         const SizedBox(height: 16),
@@ -494,6 +491,23 @@ class _MarketplaceCheckoutScreenState extends ConsumerState<MarketplaceCheckoutS
   }
 
   Future<void> _handleMinipayCheckout(MarketplaceItemModel item) async {
+    if (!AppConfig.isNativeMinipayCheckoutEnabled) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'MiniPay checkout is coming soon.',
+              style: GoogleFonts.inter(fontSize: 14),
+            ),
+            backgroundColor: AppTheme.placeholderColor,
+            behavior: SnackBarBehavior.floating,
+            duration: const Duration(seconds: 3),
+          ),
+        );
+      }
+      return;
+    }
+
     if (!_formKey.currentState!.validate()) return;
 
     setState(() => _isSubmitting = true);
@@ -517,12 +531,15 @@ class _MarketplaceCheckoutScreenState extends ConsumerState<MarketplaceCheckoutS
       if (!mounted) return;
 
       final checkoutUri = Uri.parse(session.checkoutUrl);
-      final launched = await launchMinipayCheckoutUrl(checkoutUri);
+      final launched = await launchMinipayCheckoutDeeplink(checkoutUri);
 
       if (!launched && mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Could not open MiniPay checkout URL.'),
+          SnackBar(
+            content: Text(
+              'Could not open MiniPay. Copy the checkout link and try opening it inside MiniPay.',
+              style: GoogleFonts.inter(fontSize: 14),
+            ),
             backgroundColor: Colors.red,
           ),
         );
@@ -585,13 +602,21 @@ class _MarketplaceCheckoutScreenState extends ConsumerState<MarketplaceCheckoutS
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       Text(
-                        'This checkout must be opened inside MiniPay to sign and confirm the payment. '
-                        'If this opened in Chrome or another browser, copy the checkout link and open it inside MiniPay. '
-                        'Return here and tap Check Payment Status.',
+                        'This payment must be confirmed inside MiniPay. If the checkout opens in Chrome or a normal browser, MiniPay wallet signing will not be available. Tap Open in MiniPay, or copy the link and try opening it inside MiniPay. Return here after payment and tap Check Payment Status.',
                         style: GoogleFonts.inter(
                           color: AppTheme.textSecondary,
                           fontSize: 13,
                           height: 1.45,
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      Text(
+                        'MiniPay provider access may require the checkout URL to be approved or listed by MiniPay.',
+                        style: GoogleFonts.inter(
+                          color: AppTheme.textSecondary,
+                          fontSize: 11,
+                          height: 1.4,
+                          fontStyle: FontStyle.italic,
                         ),
                       ),
                       const SizedBox(height: 16),
@@ -612,6 +637,34 @@ class _MarketplaceCheckoutScreenState extends ConsumerState<MarketplaceCheckoutS
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 mainAxisSize: MainAxisSize.min,
                 children: [
+                  OutlinedButton(
+                    onPressed: () async {
+                      final checkoutUri = Uri.parse(session.checkoutUrl);
+                      final opened = await launchMinipayCheckoutDeeplink(checkoutUri);
+                      if (!opened && dialogContext.mounted) {
+                        ScaffoldMessenger.of(dialogContext).showSnackBar(
+                          SnackBar(
+                            content: Text(
+                              'Could not open MiniPay. Copy the checkout link and try opening it inside MiniPay.',
+                              style: GoogleFonts.inter(fontSize: 13),
+                            ),
+                            behavior: SnackBarBehavior.floating,
+                            duration: const Duration(seconds: 5),
+                          ),
+                        );
+                      }
+                    },
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: AppTheme.textPrimary,
+                      side: const BorderSide(color: Colors.white24),
+                      padding: const EdgeInsets.symmetric(vertical: 12),
+                    ),
+                    child: Text(
+                      'Open in MiniPay',
+                      style: GoogleFonts.inter(fontWeight: FontWeight.w600),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
                   OutlinedButton(
                     onPressed: () async {
                       await Clipboard.setData(
@@ -860,6 +913,22 @@ class _MarketplaceCheckoutScreenState extends ConsumerState<MarketplaceCheckoutS
       final itemId = widget.item!.id;
       final energyPoints = widget.item!.energyPointsPrice;
 
+      if (!MarketplaceOffer.isPurchasable(widget.item!)) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                MarketplaceOffer.isExpired(widget.item!)
+                    ? 'This offer has expired.'
+                    : 'This product is no longer available.',
+              ),
+              backgroundColor: Colors.red,
+            ),
+          );
+        }
+        return;
+      }
+
       final userId = _supabaseService.currentUserId;
       if (userId != null) {
         final currentPoints = await _supabaseService.getCurrentUserEnergyPoints();
@@ -896,9 +965,12 @@ class _MarketplaceCheckoutScreenState extends ConsumerState<MarketplaceCheckoutS
       }
     } catch (e) {
       if (mounted) {
+        final message = e.toString().contains('OFFER_EXPIRED')
+            ? 'This offer has expired.'
+            : 'Error processing checkout: $e';
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Error processing checkout: $e'),
+            content: Text(message),
             backgroundColor: Colors.red,
             duration: const Duration(seconds: 5),
           ),
@@ -1550,4 +1622,5 @@ class _MarketplaceCheckoutScreenState extends ConsumerState<MarketplaceCheckoutS
     );
   }
 }
+
 
