@@ -35,6 +35,7 @@ const state = {
   toastTimer: null,
   ui: {
     menuOpen: false,
+    menuSettingsOpen: false,
     searchOpen: false,
     filterOpen: false,
     searchQuery: '',
@@ -50,6 +51,10 @@ const state = {
 function cfg() {
   return window.MP_MARKETPLACE_CONFIG || window.MOVEPLUS_MARKETPLACE_CONFIG || {}
 }
+
+const ACCOUNT_LINK_STORAGE_KEY = 'moveplus_marketplace_account_linked_v1'
+const ACCOUNT_LINK_ICON_PATH = './assets/icons/link-svgrepo-com.svg'
+const ACCOUNT_WALLET_ICON_PATH = './assets/icons/wallet-2-svgrepo-com.svg'
 
 function qs(name) {
   return new URLSearchParams(window.location.search).get(name)?.trim() ?? ''
@@ -131,6 +136,43 @@ function readBoolField(value, defaultWhenNull = false) {
   return Boolean(value)
 }
 
+function parseOfferEndsAt(value) {
+  if (!value) return null
+  const d = new Date(value)
+  return Number.isNaN(d.getTime()) ? null : d
+}
+
+function isOfferExpiredRow(row, now = new Date()) {
+  const limited = readBoolField(row.is_limited_offer, false)
+  if (!limited) return false
+  const ends = parseOfferEndsAt(row.offer_ends_at)
+  if (!ends) return true
+  return now.getTime() >= ends.getTime()
+}
+
+function isOfferExpiredProduct(product, now = new Date()) {
+  if (!product?.isLimitedOffer) return false
+  const ends = product.offerEndsAt
+  if (!ends) return true
+  return now.getTime() >= ends.getTime()
+}
+
+function offerCountdownLabel(endsAt, now = new Date()) {
+  if (!endsAt) return null
+  const ms = endsAt.getTime() - now.getTime()
+  if (ms <= 0) return 'Expired'
+  const hours = Math.floor(ms / 3600000)
+  if (hours >= 24) return `Ends in ${Math.ceil(hours / 24)}d`
+  if (hours >= 1) return `Ends in ${hours}h`
+  const minutes = Math.max(1, Math.ceil(ms / 60000))
+  return `Ends in ${minutes}m`
+}
+
+function offerBadgeLabel(product) {
+  const custom = String(product.offerLabel ?? '').trim()
+  return custom || 'Limited offer'
+}
+
 /**
  * Map Supabase marketplace_items row to web catalog product.
  * stock_quantity: null = untracked, 0 = sold out, >0 = capped quantity.
@@ -146,7 +188,11 @@ function normalizeMarketplaceProduct(row) {
 
   const isDeleted = readBoolField(row.is_deleted, false)
   const isAvailableFlag = readBoolField(row.is_available, true)
-  const isAvailable = isAvailableFlag && !isDeleted
+  const isLimitedOffer = readBoolField(row.is_limited_offer, false)
+  const offerEndsAt = parseOfferEndsAt(row.offer_ends_at)
+  const offerLabel = String(row.offer_label ?? '').trim() || null
+  const offerExpired = isLimitedOffer && isOfferExpiredRow(row)
+  const isAvailable = isAvailableFlag && !isDeleted && !offerExpired
 
   const isSoldOut = !isAvailable || (stock !== null && stock === 0)
 
@@ -172,6 +218,14 @@ function normalizeMarketplaceProduct(row) {
     stock,
     isAvailable,
     isSoldOut,
+    isLimitedOffer,
+    offerEndsAt,
+    offerLabel,
+    offerExpired,
+    offerCountdown:
+      isLimitedOffer && offerEndsAt && !offerExpired
+        ? offerCountdownLabel(offerEndsAt)
+        : null,
     createdAt: row.created_at ?? null,
   }
 }
@@ -318,6 +372,10 @@ function productSnapshot(product) {
     stock: product.stock,
     isSoldOut: product.isSoldOut,
     isAvailable: product.isAvailable,
+    isLimitedOffer: product.isLimitedOffer,
+    offerEndsAt: product.offerEndsAt ? product.offerEndsAt.toISOString() : null,
+    offerLabel: product.offerLabel,
+    offerExpired: product.offerExpired,
   }
 }
 
@@ -346,6 +404,10 @@ function resolveCartLine(line) {
       stock: merged.stock ?? null,
       isSoldOut: live ? live.isSoldOut : Boolean(merged.isSoldOut),
       isAvailable: live ? live.isAvailable : merged.isAvailable !== false,
+      isLimitedOffer: live ? live.isLimitedOffer : Boolean(merged.isLimitedOffer),
+      offerEndsAt: live?.offerEndsAt ?? (merged.offerEndsAt ? new Date(merged.offerEndsAt) : null),
+      offerLabel: live?.offerLabel ?? merged.offerLabel ?? null,
+      offerExpired: live ? live.offerExpired : Boolean(merged.offerExpired),
     },
     missing: !live && !snap.title,
   }
@@ -403,7 +465,10 @@ function hideToast() {
 
 function addToCart(product, quantity = 1) {
   if (!product || isDigitalGear(product) || state.catalogTab === 'gear') return false
-  if (product.isSoldOut) return false
+  if (product.isSoldOut || product.offerExpired) {
+    if (product.offerExpired) showToast('This offer has expired.', null, null)
+    return false
+  }
   const qty = Math.max(1, Math.floor(Number(quantity) || 1))
   const max = getMaxCartQuantity(product)
   if (max <= 0) return false
@@ -477,7 +542,13 @@ function buildCheckoutItemsPayload() {
 }
 
 function cartHasUnavailableItems() {
-  return getCartLines().some((line) => line.product.isSoldOut || !line.product.isAvailable)
+  return getCartLines().some(
+    (line) =>
+      line.product.isSoldOut ||
+      !line.product.isAvailable ||
+      line.product.offerExpired ||
+      isOfferExpiredProduct(line.product),
+  )
 }
 
 function formatEnergyPriceHtml(amount) {
@@ -718,12 +789,12 @@ async function loadCatalog() {
   try {
     // Same filters as native SupabaseService.getMarketplaceItems()
     const select =
-      'id,title,description,image_url,energy_points_price,crypto_price,crypto_currency,category,stock_quantity,is_available,is_deleted,created_at,updated_at'
+      'id,title,description,image_url,energy_points_price,crypto_price,crypto_currency,category,stock_quantity,is_available,is_deleted,is_limited_offer,offer_ends_at,offer_label,created_at,updated_at'
     const query = `${table}?select=${select}&is_available=eq.true&is_deleted=eq.false&order=created_at.desc`
     let rows = await supabaseRest(query)
     if (!Array.isArray(rows)) rows = []
 
-    let products = rows.map(normalizeMarketplaceProduct).filter((p) => p.id && p.isAvailable)
+    let products = rows.map(normalizeMarketplaceProduct).filter((p) => p.id && p.isAvailable && !p.offerExpired)
 
     if (products.length === 0 && isDemoMode()) {
       products = demoProducts().map(normalizeMarketplaceProduct)
@@ -877,11 +948,18 @@ function productCardHtml(product) {
     : `<div class="product-image placeholder">No image</div>`
   const cryptoLabel = formatProductCryptoLabel(product) || '—'
 
+  const offerBadge =
+    product.isLimitedOffer && product.offerCountdown
+      ? `<span class="badge offer-badge">${escapeHtml(product.offerCountdown)}</span>`
+      : product.isLimitedOffer
+        ? `<span class="badge offer-badge">${escapeHtml(offerBadgeLabel(product))}</span>`
+        : ''
+
   return `
     <button type="button" class="product-card" data-item-id="${escapeHtml(product.id)}" ${product.isSoldOut ? 'disabled' : ''}>
       <div class="product-image-wrap">
         ${imageBlock}
-        ${product.isSoldOut ? '<span class="badge">Sold out</span>' : ''}
+        ${product.isSoldOut ? '<span class="badge">Sold out</span>' : offerBadge}
       </div>
       <div class="product-body">
         <h2 class="product-title">${escapeHtml(product.title)}</h2>
@@ -1094,6 +1172,11 @@ function renderDetail(main) {
   const img = product.imageUrl
   const images = product.images?.length ? product.images : img ? [img] : []
   const soldOut = product.isSoldOut
+  const offerExpired = product.offerExpired || isOfferExpiredProduct(product)
+  const offerNote =
+    product.isLimitedOffer && !offerExpired && product.offerCountdown
+      ? `<div class="meta-row"><span class="meta-label">Offer</span><span class="meta-value">${escapeHtml(offerBadgeLabel(product))} · ${escapeHtml(product.offerCountdown)}</span></div>`
+      : ''
   const manualOrderNote =
     product.category === 'Vouchers'
       ? 'This item may be fulfilled manually after order review.'
@@ -1120,11 +1203,13 @@ function renderDetail(main) {
     <section class="card">
       <div class="alert alert-info">${escapeHtml(manualOrderNote)}</div>
       ${soldOut ? `<div class="alert alert-warn">This product is currently unavailable.</div>` : ''}
+      ${offerExpired ? `<div class="alert alert-warn">This offer has expired.</div>` : ''}
+      ${offerNote}
     </section>
     ${diagnosticsHtml()}
     <div class="action-bar" id="detail-actions">
-      <button type="button" class="btn btn-secondary ${soldOut ? 'btn-disabled' : ''}" id="add-to-cart-btn" ${soldOut ? 'disabled' : ''}>Add to Cart</button>
-      <button type="button" class="btn btn-primary ${soldOut ? 'btn-disabled' : ''}" id="buy-now-btn" ${soldOut ? 'disabled' : ''}>Buy Now</button>
+      <button type="button" class="btn btn-secondary ${soldOut || offerExpired ? 'btn-disabled' : ''}" id="add-to-cart-btn" ${soldOut || offerExpired ? 'disabled' : ''}>Add to Cart</button>
+      <button type="button" class="btn btn-primary ${soldOut || offerExpired ? 'btn-disabled' : ''}" id="buy-now-btn" ${soldOut || offerExpired ? 'disabled' : ''}>Buy Now</button>
     </div>
   `
 
@@ -1173,8 +1258,8 @@ function renderCart(main) {
             <div class="cart-line-price">${formatEnergyPriceHtml(p.energyPrice)}</div>
             <div class="cart-line-crypto">${escapeHtml(formatProductCryptoLabel(p) || '—')} each</div>
             ${
-              p.isSoldOut
-                ? `<div class="cart-line-warn">Unavailable — remove to continue</div>`
+              p.isSoldOut || p.offerExpired || isOfferExpiredProduct(p)
+                ? `<div class="cart-line-warn">${p.offerExpired || isOfferExpiredProduct(p) ? 'This offer has expired.' : 'Unavailable — remove to continue'}</div>`
                 : `<div class="qty-row">
                     <button type="button" class="qty-btn" data-qty-dec="${escapeHtml(line.productId)}" aria-label="Decrease quantity">−</button>
                     <input type="number" class="qty-input" min="1" max="${maxQty}" value="${line.quantity}" data-qty-input="${escapeHtml(line.productId)}" inputmode="numeric" />
@@ -1200,7 +1285,7 @@ function renderCart(main) {
       <div class="meta-row"><span class="meta-label">Delivery</span><span class="meta-value">Philippines only</span></div>
       <p class="detail-desc" style="margin-top:8px">Display totals are estimates. Payment amount is calculated by the server at checkout.</p>
     </section>
-    ${cartHasUnavailableItems() ? `<section class="card"><div class="alert alert-warn">Remove unavailable items before checkout.</div></section>` : ''}
+    ${cartHasUnavailableItems() ? `<section class="card"><div class="alert alert-warn">Remove expired or unavailable items before checkout.</div></section>` : ''}
     ${diagnosticsHtml()}
     <div class="action-bar">
       <button type="button" class="btn btn-secondary" id="continue-shopping">Continue Shopping</button>
@@ -1524,7 +1609,7 @@ function renderPaid(main) {
         hasReceipt
           ? `<p class="detail-desc">Receipt recorded on Celo. Your order is pending fulfillment.</p>`
           : receiptPending
-            ? `<p class="detail-desc">Payment verified. On-chain receipt is pending — your order is still being processed.</p>`
+            ? `<p class="detail-desc">Payment verified. On-chain receipt is pending — your order is confirmed and awaiting fulfillment.</p>`
             : `<p class="detail-desc">Your order is pending fulfillment. Thank you for shopping with Move+.</p>`
       }
       <div class="meta-row"><span class="meta-label">Product</span><span class="meta-value">${escapeHtml(session?.itemTitle || '—')}</span></div>
@@ -1541,7 +1626,7 @@ function renderPaid(main) {
       }
       ${
         receiptPending && !hasReceipt
-          ? `<div class="alert alert-info" style="margin-top:12px">On-chain receipt will be recorded shortly. No action needed.</div>`
+          ? `<div class="alert alert-info" style="margin-top:12px">On-chain receipt may be recorded later by Move+. No action needed from you.</div>`
           : ''
       }
     </section>
@@ -1631,6 +1716,20 @@ function cfgUrl(key, fallback) {
   return typeof v === 'string' && v.trim() ? v.trim().replace(/\/+$/, '') : fallback
 }
 
+function legalPageUrl(page) {
+  const key = `${page}Url`
+  const defaults = {
+    terms: 'terms',
+    privacy: 'privacy',
+    refund: 'refund',
+  }
+  return cfgUrl(key, defaults[page] || page)
+}
+
+function openLegalPage(page) {
+  window.location.href = legalPageUrl(page)
+}
+
 function openExternalUrl(url) {
   window.open(url, '_blank', 'noopener,noreferrer')
 }
@@ -1642,6 +1741,87 @@ function setOverlayVisible(visible) {
   overlay.setAttribute('aria-hidden', visible ? 'false' : 'true')
 }
 
+function parseBoolean(value) {
+  if (value === true || value === 'true' || value === 1 || value === '1') return true
+  if (value === false || value === 'false' || value === 0 || value === '0') return false
+  return null
+}
+
+function isMoveplusAccountLinked() {
+  const configFlag = parseBoolean(cfg().moveplusAccountLinked)
+  if (configFlag != null) return configFlag
+  try {
+    return localStorage.getItem(ACCOUNT_LINK_STORAGE_KEY) === '1'
+  } catch (_) {
+    return false
+  }
+}
+
+function syncAccountHeaderButton() {
+  const btn = document.getElementById('btn-account')
+  const icon = document.getElementById('account-header-icon')
+  if (!btn || !icon) return
+
+  const linked = isMoveplusAccountLinked()
+  icon.classList.add('account-icon-img', 'original-color')
+  if (linked) {
+    icon.src = ACCOUNT_WALLET_ICON_PATH
+    btn.setAttribute('aria-label', 'Move+ Account')
+    btn.setAttribute('title', 'Move+ Account')
+  } else {
+    icon.src = ACCOUNT_LINK_ICON_PATH
+    btn.setAttribute('aria-label', 'Link Move+ Account')
+    btn.setAttribute('title', 'Link Move+ Account')
+  }
+}
+
+function buildAccountModalBody(leadText, noteTexts) {
+  const container = document.createDocumentFragment()
+  const lead = document.createElement('p')
+  lead.className = 'modal-lead'
+  lead.textContent = leadText
+  container.appendChild(lead)
+  noteTexts.forEach((text) => {
+    const note = document.createElement('p')
+    note.className = 'modal-note'
+    note.textContent = text
+    container.appendChild(note)
+  })
+  return container
+}
+
+function openMoveplusAccountSheet() {
+  const linked = isMoveplusAccountLinked()
+  const appUrl = cfg().moveplusAppDeepLink || cfg().moveplusHomeUrl || 'https://amayatoken.online/moveplus/'
+
+  if (linked) {
+    openModal({
+      title: 'Move+ Account',
+      bodyElement: buildAccountModalBody('Your Move+ account is linked.', [
+        'Energy balance and gear summary will appear here soon.',
+        'MiniPay checkout currently applies to Real Items only.',
+      ]),
+      primaryLabel: 'Open Move+ App',
+      primaryAction: () => openExternalUrl(appUrl),
+      secondaryLabel: 'Close',
+      secondaryAction: closeModal,
+    })
+    return
+  }
+
+  openModal({
+    title: 'Link Move+ Account',
+    bodyElement: buildAccountModalBody(
+      'Link your Move+ account to view Energy balance and gear summary in this marketplace.',
+      ['Linking is coming soon.', 'MiniPay checkout currently applies to Real Items only.'],
+    ),
+    primaryLabel: 'Link Move+ Account',
+    primaryAction: () => showToast('Move+ account linking is coming soon.', null, null),
+    secondaryLabel: 'Close',
+    secondaryAction: closeModal,
+  })
+}
+
 function closeAllHeaderOverlays() {
   state.ui.menuOpen = false
   state.ui.filterOpen = false
@@ -1651,17 +1831,55 @@ function closeAllHeaderOverlays() {
   setOverlayVisible(false)
 }
 
-function openModal({ title, body, primaryLabel, primaryAction, secondaryLabel, secondaryAction }) {
+function openModal({
+  title,
+  body,
+  bodyElement,
+  primaryLabel,
+  primaryAction,
+  secondaryLabel,
+  secondaryAction,
+}) {
   const modal = document.getElementById('mp-modal')
   if (!modal) return
-  modal.innerHTML = `
-    <h2 class="modal-title">${escapeHtml(title)}</h2>
-    <p class="modal-body">${escapeHtml(body)}</p>
-    <div class="modal-actions">
-      ${primaryLabel ? `<button type="button" class="btn btn-primary" id="mp-modal-primary">${escapeHtml(primaryLabel)}</button>` : ''}
-      ${secondaryLabel ? `<button type="button" class="btn btn-secondary" id="mp-modal-secondary">${escapeHtml(secondaryLabel)}</button>` : ''}
-    </div>
-  `
+  modal.innerHTML = ''
+
+  const titleEl = document.createElement('h2')
+  titleEl.className = 'modal-title'
+  titleEl.textContent = title
+  modal.appendChild(titleEl)
+
+  const bodyWrap = document.createElement('div')
+  bodyWrap.className = 'modal-body'
+  if (bodyElement) {
+    bodyWrap.appendChild(bodyElement)
+  } else if (body) {
+    const p = document.createElement('p')
+    p.textContent = body
+    bodyWrap.appendChild(p)
+  }
+  modal.appendChild(bodyWrap)
+
+  const actions = document.createElement('div')
+  actions.className = 'modal-actions'
+  if (primaryLabel) {
+    const primaryBtn = document.createElement('button')
+    primaryBtn.type = 'button'
+    primaryBtn.className = 'btn btn-primary'
+    primaryBtn.id = 'mp-modal-primary'
+    primaryBtn.textContent = primaryLabel
+    actions.appendChild(primaryBtn)
+  }
+  if (secondaryLabel) {
+    const secondaryBtn = document.createElement('button')
+    secondaryBtn.type = 'button'
+    secondaryBtn.className = 'btn btn-secondary'
+    secondaryBtn.id = 'mp-modal-secondary'
+    secondaryBtn.textContent = secondaryLabel
+    actions.appendChild(secondaryBtn)
+  }
+  modal.appendChild(actions)
+
   modal.classList.remove('hidden')
   modal.setAttribute('aria-hidden', 'false')
   updateOverlayState()
@@ -1709,9 +1927,33 @@ function openMenuDrawer() {
         </button>
       </li>
       <li class="menu-item"><button type="button" class="menu-link" data-menu="orders">My Orders / Track Order</button></li>
-      <li class="menu-item"><button type="button" class="menu-link" data-menu="support">Support</button></li>
       <li class="menu-item"><button type="button" class="menu-link" data-menu="delivery">Delivery Info</button></li>
       <li class="menu-item"><button type="button" class="menu-link" data-menu="open-app">Open Move+ App</button></li>
+      <li class="menu-item menu-settings">
+        <button
+          type="button"
+          class="menu-link menu-settings-toggle"
+          id="menu-settings-toggle"
+          aria-expanded="${state.ui.menuSettingsOpen ? 'true' : 'false'}"
+          aria-controls="menu-settings-panel"
+        >
+          <span>Settings</span>
+          <svg class="menu-settings-chevron${state.ui.menuSettingsOpen ? ' expanded' : ''}" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M6 9l6 6 6-6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+        </button>
+        <ul
+          id="menu-settings-panel"
+          class="menu-sublist${state.ui.menuSettingsOpen ? '' : ' hidden'}"
+          role="group"
+          aria-label="Settings"
+        >
+          <li class="menu-subitem"><button type="button" class="menu-link menu-sublink" data-menu="terms">Terms of Service</button></li>
+          <li class="menu-subitem"><button type="button" class="menu-link menu-sublink" data-menu="privacy">Privacy Policy</button></li>
+          <li class="menu-subitem"><button type="button" class="menu-link menu-sublink" data-menu="refund">Refund Policy</button></li>
+          <li class="menu-subitem"><button type="button" class="menu-link menu-sublink" data-menu="support">Support</button></li>
+        </ul>
+      </li>
     </ul>
   `
 
@@ -1720,6 +1962,17 @@ function openMenuDrawer() {
   updateOverlayState()
 
   document.getElementById('menu-close')?.addEventListener('click', closeMenuDrawer)
+
+  const settingsToggle = document.getElementById('menu-settings-toggle')
+  const settingsPanel = document.getElementById('menu-settings-panel')
+  settingsToggle?.addEventListener('click', () => {
+    state.ui.menuSettingsOpen = !state.ui.menuSettingsOpen
+    const expanded = state.ui.menuSettingsOpen
+    settingsToggle.setAttribute('aria-expanded', expanded ? 'true' : 'false')
+    settingsPanel?.classList.toggle('hidden', !expanded)
+    settingsToggle.querySelector('.menu-settings-chevron')?.classList.toggle('expanded', expanded)
+  })
+
   drawer.querySelectorAll('[data-menu]').forEach((btn) => {
     btn.addEventListener('click', () => {
       const action = btn.getAttribute('data-menu')
@@ -1734,6 +1987,18 @@ function openMenuDrawer() {
       }
       if (action === 'orders') {
         openTrackOrdersModal()
+        return
+      }
+      if (action === 'terms') {
+        openLegalPage('terms')
+        return
+      }
+      if (action === 'privacy') {
+        openLegalPage('privacy')
+        return
+      }
+      if (action === 'refund') {
+        openLegalPage('refund')
         return
       }
       if (action === 'support') {
@@ -1945,9 +2210,12 @@ function initHeaderUi() {
   const btnSearch = document.getElementById('btn-search')
   const btnFilter = document.getElementById('btn-filter')
   const btnCart = document.getElementById('btn-cart')
+  const btnAccount = document.getElementById('btn-account')
   const btnClear = document.getElementById('btn-search-clear')
   const searchInput = document.getElementById('search-input')
   const overlay = document.getElementById('ui-overlay')
+
+  syncAccountHeaderButton()
 
   btnMenu?.addEventListener('click', () => {
     if (state.ui.menuOpen) {
@@ -1984,6 +2252,12 @@ function initHeaderUi() {
     closeMenuDrawer()
     closeFilterSheet()
     setView('cart')
+  })
+
+  btnAccount?.addEventListener('click', () => {
+    closeMenuDrawer()
+    closeFilterSheet()
+    openMoveplusAccountSheet()
   })
 
   overlay?.addEventListener('click', () => {
