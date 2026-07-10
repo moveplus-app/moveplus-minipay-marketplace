@@ -139,3 +139,56 @@ International delivery may be added later after logistics and payment rules are 
 - MiniPay payment does not deduct Energy Points
 - Customer delivery information stays off-chain
 - Digital Gear preview has no MiniPay payment or signing flow
+
+## Proof of Ship Links
+
+### MiniPay Submission
+
+Move+ Marketplace has been submitted for MiniPay Explore review.
+
+Marketplace URL:  
+https://amayatoken.online/moveplus/marketplace/?v=20260708-submit-1
+
+### Celo Mainnet Contract
+
+MovePlusMarketplacePayments  
+0x5A49DA3337bBd589065cbd5d89090BDb06b51A18
+
+Explorer:  
+https://celoscan.io/address/0x5A49DA3337bBd589065cbd5d89090BDb06b51A18
+
+### cUSD Token
+
+cUSD on Celo Mainnet  
+0x765DE816845861e75A25fCA122bb6898B8B1282a
+
+### Network Manifest
+
+See:  
+NETWORK_MANIFEST.md
+
+## Sample Transactions
+
+### Contract Setup
+
+cUSD was enabled on the MovePlusMarketplacePayments contract using:
+
+`setAllowedToken(cUSD, true)`
+
+Transaction:  
+Pending link / add tx hash here
+
+### Marketplace Payment Receipt
+
+User-facing MiniPay/cUSD checkout receipt method:
+
+`recordDirectPayment(orderIdHash, payer, token, amount, paymentTxHash)`
+
+Sample receipt transaction:  
+Pending first live MiniPay/cUSD test.
+
+After the first verified cUSD marketplace payment, this section will be updated with:
+
+- cUSD payment transaction hash
+- MovePlusMarketplacePayments receipt transaction hash
+- OrderPaid event link
