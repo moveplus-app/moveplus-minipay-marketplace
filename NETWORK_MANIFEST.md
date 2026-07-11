@@ -14,7 +14,6 @@ Public URLs and origins used by the web Marketplace. **No secrets** — service 
 | Refund Policy | `https://amayatoken.online/moveplus/marketplace/refund/` |
 
 ## Supabase (backend)
-All public reads/writes are protected by Supabase RLS policies and Edge Function validation.
 
 | Purpose | URL / origin |
 |--------|----------------|
@@ -41,6 +40,7 @@ The browser uses the **Supabase anon key** only. The **service role key is never
 | Payment token | cUSD |
 | cUSD token contract (Celo mainnet) | `0x765DE816845861e75A25fCA122bb6898B8B1282a` |
 | MovePlusMarketplacePayments contract | `0x5A49DA3337bBd589065cbd5d89090BDb06b51A18` |
+| Verified source (CeloScan) | https://celoscan.io/address/0x5A49DA3337bBd589065cbd5d89090BDb06b51A18#code |
 
 MiniPay checkout transfers cUSD to the configured Move+ treasury wallet. On-chain receipt registration via `MovePlusMarketplacePayments.recordDirectPayment` is optional and owner-controlled; payment success does not depend on it for V1 checkout.
 
@@ -56,16 +56,12 @@ MiniPay checkout transfers cUSD to the configured Move+ treasury wallet. On-chai
 
 | Purpose | Notes |
 |--------|--------|
-| MiniPay injected wallet | Uses `window.ethereum` inside MiniPay for ERC-20 transfer signing |
-| Wallet connect | User’s MiniPay/Celo wallet for ERC-20 transfer signing |
+| MiniPay | Detected via `window.ethereum.isMiniPay` when available |
+| Wallet auto-connect | MiniPay provider prepared on page load; no manual Connect Wallet UI |
+| Payment signing | User confirms cUSD ERC-20 transfer via MiniPay |
 
 ## Not included (intentionally)
 
 - `SUPABASE_SERVICE_ROLE_KEY`
 - `CELO_MARKETPLACE_PAYMENTS_OWNER_PRIVATE_KEY`
 - Rate limit salts, Turnstile secrets, or other server-only env vars
-
-- ## DNS / CDN
-
-- DNS/CDN: Cloudflare
-- Hosting: Hostinger
