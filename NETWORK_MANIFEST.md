@@ -1,6 +1,8 @@
-# Move+ Web Marketplace — Network Manifest
+# Move+ — Network Manifest (Web Marketplace)
 
-Public URLs and origins used by the web Marketplace. **No secrets** — service role keys, owner private keys, and other privileged credentials are server-side only.
+Public URLs and origins used by the **Move+ Web Marketplace** MiniPay submission. **No secrets** — service role keys, owner private keys, and other privileged credentials are server-side only.
+
+Canonical copy also lives at `web/marketplace/NETWORK_MANIFEST.md`.
 
 ## Hosted site
 
@@ -27,7 +29,14 @@ Edge functions used by MiniPay checkout (public names only):
 - `minipay-checkout-verify-payment`
 - `minipay-checkout-session-status`
 
-The browser uses the **Supabase anon key** only. The **service role key is never exposed** to the frontend.
+Edge functions used by Move+ account linking (public names only):
+
+- `create-marketplace-link-session` (authenticated app JWT)
+- `marketplace-link-verify` (one-time `link_token`)
+- `marketplace-account-summary` (marketplace web session token)
+- `marketplace-link-disconnect` (marketplace web session token)
+
+The browser uses the **Supabase anon key** only. The **service role key is never exposed** to the frontend. Account link never puts a Supabase JWT in the URL.
 
 ## Celo / MiniPay
 
@@ -37,12 +46,16 @@ The browser uses the **Supabase anon key** only. The **service role key is never
 | Chain ID | `42220` |
 | RPC (server / verification) | `https://forno.celo.org` |
 | Block explorer (tx links) | `https://celoscan.io/tx/` |
-| Payment token | cUSD |
-| cUSD token contract (Celo mainnet) | `0x765DE816845861e75A25fCA122bb6898B8B1282a` |
+| Checkout currencies | USDT, USDC, cUSD (CELO is **not** used as checkout currency) |
+| USDT | `0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e` (6 decimals) |
+| USDC | `0xcebA9300f2b948710d2653dD7B07f33A8B32118C` (6 decimals) |
+| cUSD | `0x765DE816845861e75A25fCA122bb6898B8B1282a` (18 decimals) |
 | MovePlusMarketplacePayments contract | `0x5A49DA3337bBd589065cbd5d89090BDb06b51A18` |
-| Verified source (CeloScan) | https://celoscan.io/address/0x5A49DA3337bBd589065cbd5d89090BDb06b51A18#code |
+| Verified contract source (CeloScan) | https://celoscan.io/address/0x5A49DA3337bBd589065cbd5d89090BDb06b51A18#code |
 
-MiniPay checkout transfers cUSD to the configured Move+ treasury wallet. On-chain receipt registration via `MovePlusMarketplacePayments.recordDirectPayment` is optional and owner-controlled; payment success does not depend on it for V1 checkout.
+Product `crypto_price` is a USD stablecoin amount. Checkout lets the user pick USDT, USDC, or cUSD; the server resolves address/decimals from its registry (client never supplies them).
+
+MiniPay checkout transfers the selected stablecoin to the configured Move+ treasury wallet. On-chain receipt registration via `MovePlusMarketplacePayments.recordDirectPayment` is optional and owner-controlled. If `allowedTokens(token)` is false for a selected token, payment can still verify as paid and receipt stays `receipt_pending` until the owner enables the token with `setAllowedToken`.
 
 ## Static assets
 
@@ -58,7 +71,7 @@ MiniPay checkout transfers cUSD to the configured Move+ treasury wallet. On-chai
 |--------|--------|
 | MiniPay | Detected via `window.ethereum.isMiniPay` when available |
 | Wallet auto-connect | MiniPay provider prepared on page load; no manual Connect Wallet UI |
-| Payment signing | User confirms cUSD ERC-20 transfer via MiniPay |
+| Payment signing | User confirms selected stablecoin ERC-20 transfer via MiniPay |
 
 ## Not included (intentionally)
 
