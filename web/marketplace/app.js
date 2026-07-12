@@ -18,9 +18,27 @@ const GEAR_PLACEHOLDER_PATH = './assets/gear/gear_placeholder.png'
 
 const ERC20_TRANSFER_SELECTOR = '0xa9059cbb'
 const ERC20_BALANCE_OF_SELECTOR = '0x70a08231'
-const INSUFFICIENT_CUSD_MESSAGE =
-  'Insufficient cUSD balance. Please add cUSD to your MiniPay wallet and try again.'
 const CART_STORAGE_KEY = 'moveplus_web_marketplace_cart_v1'
+
+/** Server-authoritative Celo MiniPay stablecoin registry (display + balance checks). */
+const SUPPORTED_MINIPAY_TOKENS = {
+  USDT: {
+    symbol: 'USDT',
+    address: '0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e',
+    decimals: 6,
+  },
+  USDC: {
+    symbol: 'USDC',
+    address: '0xcebA9300f2b948710d2653dD7B07f33A8B32118C',
+    decimals: 6,
+  },
+  cUSD: {
+    symbol: 'cUSD',
+    address: '0x765DE816845861e75A25fCA122bb6898B8B1282a',
+    decimals: 18,
+  },
+}
+const MINIPAY_TOKEN_PRIORITY = ['USDT', 'USDC', 'cUSD']
 
 const state = {
   view: 'catalog',
@@ -33,6 +51,7 @@ const state = {
   checkoutSession: null,
   autoPayAfterSession: false,
   paymentInFlight: false,
+  selectedPaymentToken: 'USDT',
   loading: true,
   error: null,
   catalogMeta: null,
@@ -52,6 +71,7 @@ const state = {
     txHash: null,
     createSessionStatus: null,
     verifyStatus: null,
+    walletBalanceRaw: null,
   },
   ui: {
     menuOpen: false,
@@ -73,6 +93,8 @@ function cfg() {
 }
 
 const ACCOUNT_LINK_STORAGE_KEY = 'moveplus_marketplace_account_linked_v1'
+const ACCOUNT_SUMMARY_SESSION_KEY = 'moveplus_marketplace_account_summary_v1'
+const WEB_SESSION_STORAGE_KEY = 'moveplus_marketplace_web_session_v1'
 const ACCOUNT_LINK_ICON_PATH = './assets/icons/link-svgrepo-com.svg'
 const ACCOUNT_WALLET_ICON_PATH = './assets/icons/wallet-2-svgrepo-com.svg'
 
@@ -131,15 +153,71 @@ function showPaymentStatus(html, { error = false } = {}) {
   }
 }
 
-function expectedCusdSymbol() {
-  return String(cfg().cryptoTokenSymbol || 'cUSD').trim().toUpperCase() || 'CUSD'
+function insufficientTokenMessage(symbol) {
+  const s = String(symbol || 'token')
+  return `Insufficient ${s} balance. Please add ${s} to your MiniPay wallet or choose another token.`
 }
 
-function cartHasNonCusdItems() {
-  const expected = expectedCusdSymbol()
+function resolvePaymentToken(symbolInput) {
+  const raw = String(symbolInput ?? '').trim()
+  if (!raw) return null
+  if (SUPPORTED_MINIPAY_TOKENS[raw]) return SUPPORTED_MINIPAY_TOKENS[raw]
+  const upper = raw.toUpperCase()
+  if (upper === 'USDT') return SUPPORTED_MINIPAY_TOKENS.USDT
+  if (upper === 'USDC') return SUPPORTED_MINIPAY_TOKENS.USDC
+  if (upper === 'CUSD') return SUPPORTED_MINIPAY_TOKENS.cUSD
+  return null
+}
+
+function getSelectedPaymentToken() {
+  return resolvePaymentToken(state.selectedPaymentToken) || SUPPORTED_MINIPAY_TOKENS.USDT
+}
+
+function parseUsdPriceToRaw(amount, decimals) {
+  const n = Number(amount)
+  if (!Number.isFinite(n) || n <= 0) return null
+  const fixed = n.toFixed(Math.min(8, decimals)).replace(/\.?0+$/, '') || '0'
+  const [whole, frac = ''] = fixed.split('.')
+  const fracPadded = (frac + '0'.repeat(decimals)).slice(0, decimals)
+  const combined = `${whole}${fracPadded}`.replace(/^0+/, '') || '0'
+  return BigInt(combined)
+}
+
+function estimateRequiredRawForCart(tokenInfo) {
+  const lines = getCartLines()
+  let total = 0n
+  for (const line of lines) {
+    const unit = Number(line.product.cryptoPrice)
+    if (!Number.isFinite(unit) || unit <= 0) return null
+    const unitRaw = parseUsdPriceToRaw(unit, tokenInfo.decimals)
+    if (unitRaw == null) return null
+    total += unitRaw * BigInt(line.quantity)
+  }
+  return total
+}
+
+async function pickDefaultPaymentToken(walletAddress) {
+  const priority = MINIPAY_TOKEN_PRIORITY
+  if (!walletAddress || !window.ethereum?.request) {
+    return priority[0]
+  }
+  for (const symbol of priority) {
+    const token = SUPPORTED_MINIPAY_TOKENS[symbol]
+    try {
+      const bal = await fetchErc20BalanceRaw(token.address, walletAddress)
+      const required = estimateRequiredRawForCart(token)
+      if (required != null && bal >= required) return symbol
+    } catch (_) {
+      /* try next */
+    }
+  }
+  return priority[0]
+}
+
+function cartHasMissingCryptoPrice() {
   return getCartLines().some((line) => {
-    const symbol = String(line.product.cryptoSymbol || '').trim().toUpperCase()
-    return !symbol || symbol !== expected
+    const price = Number(line.product.cryptoPrice)
+    return !Number.isFinite(price) || price <= 0
   })
 }
 
@@ -411,9 +489,9 @@ function isInsufficientBalanceError(err) {
   )
 }
 
-function friendlyPaymentError(err) {
+function friendlyPaymentError(err, tokenSymbol) {
   if (isUserCancelledWalletError(err)) return 'Payment cancelled'
-  if (isInsufficientBalanceError(err)) return INSUFFICIENT_CUSD_MESSAGE
+  if (isInsufficientBalanceError(err)) return insufficientTokenMessage(tokenSymbol || getSelectedPaymentToken().symbol)
 
   const raw = String(err?.message ?? err ?? 'Payment failed')
   // Hide JSON-RPC / eth_estimateGas noise from normal users
@@ -425,7 +503,7 @@ function friendlyPaymentError(err) {
     raw.toLowerCase().includes('json-rpc')
 
   if (looksRawRpc && !isDebugMode()) {
-    return 'Payment could not be completed. Please try again or add cUSD to your MiniPay wallet.'
+    return 'Payment could not be completed. Please try again or choose another token.'
   }
   return raw
 }
@@ -450,8 +528,8 @@ function formatProductCryptoLabel(product) {
   if (!product || product.cryptoPrice == null) return null
   const amount = Number(product.cryptoPrice)
   if (!Number.isFinite(amount) || amount <= 0) return null
-  const symbol = product.cryptoSymbol || cfg().cryptoTokenSymbol || 'cUSD'
-  return `${formatMoneyAmount(amount)} ${symbol}`
+  // crypto_price is USD stablecoin price (USDT/USDC/cUSD share the same number).
+  return `${formatMoneyAmount(amount)} USD`
 }
 
 function formatMoneyAmount(amount) {
@@ -471,24 +549,21 @@ function cryptoPriceLabel(product) {
 
 function sumCartCryptoTotals(lines) {
   let total = 0
-  let tokenSymbol = null
   let hasPrice = false
   for (const line of lines) {
     const unit = Number(line.product.cryptoPrice)
     if (!Number.isFinite(unit) || unit <= 0) continue
     total += unit * line.quantity
     hasPrice = true
-    if (!tokenSymbol && line.product.cryptoSymbol) {
-      tokenSymbol = line.product.cryptoSymbol
-    }
   }
   if (!hasPrice) {
-    return { display: '—', tokenSymbol: null, hasPrice: false }
+    return { display: '—', tokenSymbol: null, hasPrice: false, usdTotal: 0 }
   }
   return {
-    display: `${formatMoneyAmount(total)} ${tokenSymbol || cfg().cryptoTokenSymbol || 'cUSD'}`,
-    tokenSymbol: tokenSymbol || cfg().cryptoTokenSymbol || 'cUSD',
+    display: `${formatMoneyAmount(total)} USD`,
+    tokenSymbol: getSelectedPaymentToken().symbol,
     hasPrice: true,
+    usdTotal: total,
   }
 }
 
@@ -917,6 +992,156 @@ function friendlyApiError(status, data) {
   if (status === 429) return 'Too many requests. Please wait and try again.'
   if (status === 503) return 'Checkout is temporarily unavailable.'
   return 'Could not complete checkout. Please try again.'
+}
+
+const VERIFY_PENDING_MESSAGE =
+  'Payment may have been sent, but verification is pending. Please do not pay again. Tap Check Status or contact support with your transaction hash.'
+
+function isVerifyPendingError(err, status) {
+  if (status === 503 || status === 502 || status === 504) return true
+  const msg = String(err?.message ?? err ?? '')
+  return /failed to fetch|networkerror|load failed|network request failed|temporarily unavailable|internal server error|503/i.test(
+    msg,
+  )
+}
+
+function showVerifyPendingRecovery(session, txHash, payer) {
+  const statusBox = document.getElementById('payment-status-box')
+  const payBtn = document.getElementById('confirm-pay-btn')
+  const liveStatus = document.getElementById('checkout-live-status')
+  if (liveStatus) liveStatus.textContent = 'verify pending'
+  if (payBtn) {
+    payBtn.disabled = false
+    payBtn.textContent = 'Check Status / Retry Verification'
+  }
+
+  const shortTx = shortAddr(String(txHash))
+  const html =
+    `<div class="alert alert-warn">${escapeHtml(VERIFY_PENDING_MESSAGE)}</div>` +
+    `<div class="meta-row" style="margin-top:10px"><span class="meta-label">Tx hash</span><span class="meta-value">${escapeHtml(shortTx)}</span></div>` +
+    (isDebugMode()
+      ? `<div class="meta-row"><span class="meta-label">Full tx</span><span class="meta-value" style="word-break:break-all">${escapeHtml(String(txHash))}</span></div>`
+      : '') +
+    `<button type="button" class="btn btn-primary" id="retry-verify-btn" style="margin-top:12px">Check Status / Retry Verification</button>`
+
+  if (statusBox) {
+    statusBox.style.display = 'block'
+    statusBox.innerHTML = html
+  }
+  showToast(VERIFY_PENDING_MESSAGE, null, null)
+
+  // Persist submitted tx on session so retry does not create a new checkout.
+  if (state.checkoutSession) {
+    state.checkoutSession = {
+      ...state.checkoutSession,
+      ...session,
+      txHash: String(txHash),
+      payerWalletAddress: payer || state.checkoutSession.payerWalletAddress || null,
+      verifyPending: true,
+    }
+  }
+
+  document.getElementById('retry-verify-btn')?.addEventListener('click', () => {
+    retryVerifyPayment(String(txHash), payer)
+  })
+  if (payBtn) {
+    payBtn.onclick = () => retryVerifyPayment(String(txHash), payer)
+  }
+}
+
+async function retryVerifyPayment(txHash, payer) {
+  const session = state.checkoutSession
+  if (!session?.sessionId || !session?.sessionToken || !txHash) {
+    showToast('Missing payment session. Contact support with your transaction hash.', null, null)
+    return
+  }
+
+  const payBtn = document.getElementById('confirm-pay-btn')
+  const statusBox = document.getElementById('payment-status-box')
+  const liveStatus = document.getElementById('checkout-live-status')
+  const payerAddr = normalizeAddr(payer || session.payerWalletAddress || state.minipayWalletAddress)
+
+  if (payBtn) {
+    payBtn.disabled = true
+    payBtn.textContent = 'Checking…'
+  }
+  if (liveStatus) liveStatus.textContent = 'verifying'
+  showPaymentStatus(
+    `<div class="alert alert-info">Retrying verification for ${escapeHtml(shortAddr(txHash))}…</div>`,
+  )
+  setPaymentDebug({ step: 'verify-retry-started', txHash: String(txHash), lastError: null })
+
+  try {
+    if (!payerAddr) throw new Error('Wallet address missing for verification retry')
+
+    const { status, data } = await invokeVerify({
+      session_id: session.sessionId,
+      session_token: session.sessionToken,
+      tx_hash: txHash,
+      payer_wallet_address: payerAddr,
+    })
+    setPaymentDebug({
+      step: 'verify-retry-response',
+      verifyStatus: status,
+      txHash: data?.tx_hash || String(txHash),
+    })
+
+    if (status === 202 || data?.status === 'submitted') {
+      showVerifyPendingRecovery(session, txHash, payerAddr)
+      showPaymentStatus(
+        `<div class="alert alert-warn">Transaction found but not confirmed yet. ${escapeHtml(VERIFY_PENDING_MESSAGE)}</div>`,
+      )
+      return
+    }
+
+    if (!data?.success || data.status !== 'paid') {
+      if (isVerifyPendingError(null, status)) {
+        showVerifyPendingRecovery(session, txHash, payerAddr)
+        return
+      }
+      throw new Error(friendlyApiError(status, data))
+    }
+
+    setPaymentDebug({ step: 'payment-successful', lastError: null })
+    state.paymentInFlight = false
+    setView('paid', {
+      session: {
+        ...session,
+        txHash: data.tx_hash || String(txHash),
+        explorerUrl: data.explorer_url,
+        receiptTxHash: data.receipt_tx_hash ?? null,
+        receiptExplorerUrl: data.receipt_explorer_url ?? null,
+        receiptPending: data.receipt_pending === true,
+        receiptRecorded: data.receipt_recorded === true || Boolean(data.receipt_tx_hash),
+        verifyPending: false,
+      },
+    })
+    clearCart()
+  } catch (err) {
+    logDebug('verify retry error', err)
+    if (isDebugMode()) setPaymentDebug({ lastError: String(err?.message ?? err) })
+    if (isVerifyPendingError(err)) {
+      showVerifyPendingRecovery(session, txHash, payerAddr)
+      return
+    }
+    const message = friendlyPaymentError(err, session.tokenSymbol)
+    showPaymentStatus(`<div class="alert alert-error">${escapeHtml(message)}</div>`, { error: message })
+    if (statusBox) {
+      const retryBtn = document.createElement('button')
+      retryBtn.type = 'button'
+      retryBtn.className = 'btn btn-primary'
+      retryBtn.id = 'retry-verify-btn'
+      retryBtn.style.marginTop = '12px'
+      retryBtn.textContent = 'Check Status / Retry Verification'
+      statusBox.appendChild(retryBtn)
+      retryBtn.addEventListener('click', () => retryVerifyPayment(String(txHash), payerAddr))
+    }
+    if (payBtn) {
+      payBtn.disabled = false
+      payBtn.textContent = 'Check Status / Retry Verification'
+      payBtn.onclick = () => retryVerifyPayment(String(txHash), payerAddr)
+    }
+  }
 }
 
 async function supabaseRest(path, { method = 'GET', body } = {}) {
@@ -1604,14 +1829,42 @@ function renderCheckoutForm(main) {
 
   const minipayEnabled = cfg().enableMiniPayCheckout !== false
   const inMiniPay = isMiniPayWallet()
-  const appUrl = cfg().moveplusAppDeepLink || cfg().moveplusHomeUrl || 'https://amayatoken.online/moveplus/'
-  const nonCusd = cartHasNonCusdItems()
-  const minipayReady = minipayEnabled && inMiniPay && totals.hasCryptoPrices && !nonCusd
-  const minipayBlockedReason = nonCusd
-    ? `This cart requires ${expectedCusdSymbol()} pricing. Update the product crypto currency in Admin, or remove non-${expectedCusdSymbol()} items.`
-    : !totals.hasCryptoPrices
-      ? 'Set crypto prices in Admin Dashboard before MiniPay checkout.'
-      : null
+  const missingPrice = cartHasMissingCryptoPrice() || !totals.hasCryptoPrices
+  const selectedToken = getSelectedPaymentToken()
+  const minipayReady = minipayEnabled && inMiniPay && !missingPrice
+  const minipayBlockedReason = missingPrice
+    ? 'Set a USD crypto price in Admin Dashboard before MiniPay checkout.'
+    : null
+  const payLabel = `Pay with ${selectedToken.symbol}`
+  const accountSummary = getLinkedAccountSummary()
+  const energyRequired = totals.totalEnergy
+  const energyInsufficient =
+    accountSummary.linked &&
+    accountSummary.energyBalance != null &&
+    accountSummary.energyBalance < energyRequired
+  const energyBalanceRow = accountSummary.linked
+    ? `<div class="meta-row"><span class="meta-label">Your Energy</span><span class="meta-value">${formatEnergyPriceHtml(
+        accountSummary.energyBalance != null ? accountSummary.energyBalance : 0,
+      )}${accountSummary.energyBalance == null ? ' <span class="muted-inline">(syncing)</span>' : ''}</span></div>`
+    : ''
+  const energyWarnHtml = energyInsufficient
+    ? `<div class="alert alert-warn">Insufficient Energy balance. MiniPay stablecoin checkout is still available.</div>`
+    : ''
+
+  const tokenSelectorHtml = inMiniPay && minipayEnabled && !missingPrice
+    ? `
+      <div class="token-selector" role="radiogroup" aria-label="Pay with stablecoin">
+        <div class="token-selector-label">Pay with</div>
+        <div class="token-selector-options">
+          ${MINIPAY_TOKEN_PRIORITY.map((symbol) => {
+            const active = selectedToken.symbol === symbol
+            return `<button type="button" class="token-chip ${active ? 'active' : ''}" data-payment-token="${symbol}" role="radio" aria-checked="${active}">${symbol}</button>`
+          }).join('')}
+        </div>
+        <p class="token-selector-hint">Same USD price. MiniPay accepts USDT, USDC, and cUSD on Celo.</p>
+      </div>
+    `
+    : ''
 
   main.innerHTML = `
     <button type="button" class="btn btn-ghost" id="back-cart">← Back to cart</button>
@@ -1619,8 +1872,10 @@ function renderCheckoutForm(main) {
       <h2 class="detail-title" style="font-size:17px">Checkout</h2>
       <div class="checkout-summary">${renderCheckoutSummaryHtml(totals)}</div>
       <div class="meta-row"><span class="meta-label">Total Energy</span><span class="meta-value">${formatEnergyPriceHtml(totals.totalEnergy)}</span></div>
-      <div class="meta-row"><span class="meta-label">Total crypto (est.)</span><span class="meta-value">${escapeHtml(totals.cryptoSubtotal)}</span></div>
+      ${energyBalanceRow}
+      <div class="meta-row"><span class="meta-label">Stablecoin total</span><span class="meta-value">${escapeHtml(totals.cryptoSubtotal)}</span></div>
       <div class="meta-row"><span class="meta-label">Delivery</span><span class="meta-value">Philippines only</span></div>
+      ${tokenSelectorHtml}
     </section>
     <section class="card" id="checkout-form-card">
       <h3 style="margin:0 0 12px;font-size:15px">Delivery details</h3>
@@ -1634,7 +1889,8 @@ function renderCheckoutForm(main) {
       <div id="checkout-status"></div>
     </section>
     <section class="card">
-      <div class="alert alert-info">Energy redemption is available inside the Move+ app. Open Move+ to pay with Energy Points.</div>
+      <div class="alert alert-info">Energy redemption on web uses your linked Move+ account. MiniPay crypto checkout works without linking.</div>
+      ${energyWarnHtml}
       ${
         minipayBlockedReason
           ? `<div class="alert alert-warn">${escapeHtml(minipayBlockedReason)}</div>`
@@ -1642,40 +1898,58 @@ function renderCheckoutForm(main) {
       }
       ${
         !inMiniPay
-          ? `<div class="alert alert-warn">Wallet signing is unavailable in a normal browser. Open inside MiniPay to pay with cUSD.</div>`
+          ? `<div class="alert alert-warn">Wallet signing is unavailable in a normal browser. Open inside MiniPay to pay with crypto.</div>`
           : minipayEnabled
-            ? `<div class="alert alert-info">MiniPay detected. Your wallet is ready for cUSD checkout.</div>`
+            ? `<div class="alert alert-info">MiniPay detected. Choose USDT, USDC, or cUSD to pay.</div>`
             : `<div class="alert alert-warn">MiniPay checkout is coming soon.</div>`
       }
     </section>
     ${diagnosticsHtml()}
     <div class="action-bar" id="checkout-actions">
-      <button type="button" class="btn btn-secondary" id="energy-info-btn">Pay with Energy in Move+ app</button>
+      <button type="button" class="btn btn-energy" id="energy-info-btn">Pay with ENERGY</button>
       <button type="button" class="btn btn-primary ${!minipayReady ? 'btn-disabled' : ''}" id="minipay-checkout-btn" ${!minipayReady ? 'disabled' : ''}>
-        ${minipayReady ? 'Pay with cUSD' : 'Open inside MiniPay to pay'}
+        ${minipayReady ? payLabel : 'Open inside MiniPay to pay'}
       </button>
     </div>
   `
 
   document.getElementById('back-cart')?.addEventListener('click', () => setView('cart'))
   document.getElementById('energy-info-btn')?.addEventListener('click', () => {
-    openExternalUrl(appUrl)
+    handleEnergyPayClick(energyRequired)
   })
   document.getElementById('minipay-checkout-btn')?.addEventListener('click', () => startMinipayCheckout())
+  main.querySelectorAll('[data-payment-token]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const symbol = btn.getAttribute('data-payment-token')
+      if (!resolvePaymentToken(symbol)) return
+      state.selectedPaymentToken = symbol
+      render()
+    })
+  })
 
-  // Refresh live prices/currency in background; re-render if snapshots changed.
-  ensureCatalogFreshForCheckout().then(() => {
+  // Refresh live prices in background; pick default token by balance once.
+  ensureCatalogFreshForCheckout().then(async () => {
     if (state.view !== 'checkout') return
     const refreshed = getCartTotals()
-    const nextNonCusd = cartHasNonCusdItems()
     const priceChanged = refreshed.cryptoSubtotal !== totals.cryptoSubtotal
-    if (priceChanged || nextNonCusd !== nonCusd || cartHasUnavailableItems()) {
+    if (priceChanged || cartHasUnavailableItems()) {
       render()
+      return
+    }
+    if (inMiniPay && !state._tokenDefaultPicked) {
+      state._tokenDefaultPicked = true
+      const wallet = state.minipayWalletAddress || (await prepareMiniPayWallet())
+      const preferred = await pickDefaultPaymentToken(wallet)
+      if (preferred && preferred !== state.selectedPaymentToken) {
+        state.selectedPaymentToken = preferred
+        render()
+      }
     }
   })
 }
 
 async function startMinipayCheckout() {
+  const selectedToken = getSelectedPaymentToken()
   const payBtn = document.getElementById('minipay-checkout-btn')
   const fail = (message, step = 'create-session-failed') => {
     setPaymentDebug({ step, lastError: message })
@@ -1683,7 +1957,7 @@ async function startMinipayCheckout() {
     showToast(message, null, null)
     if (payBtn) {
       payBtn.disabled = false
-      payBtn.textContent = 'Pay with cUSD'
+      payBtn.textContent = `Pay with ${selectedToken.symbol}`
     }
   }
 
@@ -1693,6 +1967,7 @@ async function startMinipayCheckout() {
     providerDetected: Boolean(window.ethereum),
     isMiniPay: isMiniPayWallet(),
     selectedAccount: state.minipayWalletAddress,
+    tokenAddress: selectedToken.address,
     createSessionStatus: null,
     verifyStatus: null,
     txHash: null,
@@ -1704,7 +1979,7 @@ async function startMinipayCheckout() {
   }
   if (!isMiniPayWallet()) {
     fail(
-      'Wallet signing is unavailable in a normal browser. Open inside MiniPay to pay with cUSD.',
+      'Wallet signing is unavailable in a normal browser. Open inside MiniPay to pay with crypto.',
       'blocked-not-minipay',
     )
     return
@@ -1735,11 +2010,8 @@ async function startMinipayCheckout() {
     fail('Remove expired or unavailable items before checkout.', 'blocked-unavailable')
     return
   }
-  if (cartHasNonCusdItems()) {
-    fail(
-      `Cart items must be priced in ${expectedCusdSymbol()}. Update product crypto currency in Admin.`,
-      'blocked-non-cusd',
-    )
+  if (cartHasMissingCryptoPrice()) {
+    fail('Cart items need a USD crypto price in Admin before MiniPay checkout.', 'blocked-missing-price')
     return
   }
 
@@ -1752,7 +2024,7 @@ async function startMinipayCheckout() {
     setPaymentDebug({ step: 'form-invalid', lastError: 'Delivery form incomplete' })
     if (payBtn) {
       payBtn.disabled = false
-      payBtn.textContent = 'Pay with cUSD'
+      payBtn.textContent = `Pay with ${selectedToken.symbol}`
     }
     return
   }
@@ -1764,6 +2036,7 @@ async function startMinipayCheckout() {
     email: form.email.value.trim(),
     delivery_address: form.delivery_address.value.trim(),
     comments: form.comments.value.trim() || null,
+    payment_token_symbol: selectedToken.symbol,
   }
 
   if (payBtn) payBtn.textContent = 'Creating checkout…'
@@ -1772,7 +2045,7 @@ async function startMinipayCheckout() {
 
   try {
     const fn = cfg().createSessionFunction || 'minipay-checkout-create-session'
-    logDebug('create-session request', { fn, items: body.items })
+    logDebug('create-session request', { fn, items: body.items, payment_token_symbol: body.payment_token_symbol })
     const { status, data } = await invokeFunction(fn, body)
     setPaymentDebug({
       step: 'create-session-response',
@@ -1782,7 +2055,13 @@ async function startMinipayCheckout() {
       treasuryAddress: data?.treasury_address ?? null,
       chainId: data?.chain_id ?? null,
     })
-    logDebug('create-session response', { status, success: data?.success, amount_raw: data?.amount_raw })
+    logDebug('create-session response', {
+      status,
+      success: data?.success,
+      amount_raw: data?.amount_raw,
+      token_symbol: data?.token_symbol,
+      token_decimals: data?.token_decimals,
+    })
 
     if (!data?.success) {
       throw new Error(friendlyApiError(status, data))
@@ -1794,6 +2073,7 @@ async function startMinipayCheckout() {
       itemTitle: data.item_title || 'Order',
       amountDisplay: data.amount_display,
       tokenSymbol: data.token_symbol,
+      tokenDecimals: data.token_decimals,
       chainName: data.chain_name || 'Celo',
       treasuryAddress: data.treasury_address,
       amountRaw: data.amount_raw,
@@ -1808,11 +2088,12 @@ async function startMinipayCheckout() {
       throw new Error('Checkout session missing payment parameters. Please try again.')
     }
 
-    // 0.01 cUSD @ 18 decimals => 10000000000000000
     logDebug('session payment params', {
       amountRaw: String(session.amountRaw),
       amountDisplay: session.amountDisplay,
       tokenAddress: session.tokenAddress,
+      tokenSymbol: session.tokenSymbol,
+      tokenDecimals: session.tokenDecimals,
       treasuryAddress: session.treasuryAddress,
       chainId: session.chainId,
     })
@@ -1845,7 +2126,8 @@ function renderPayment(main) {
   }
 
   const inMiniPay = isMiniPayWallet()
-  const payLabel = inMiniPay ? 'Pay with cUSD' : 'Open inside MiniPay to pay'
+  const tokenSymbol = session.tokenSymbol || getSelectedPaymentToken().symbol
+  const payLabel = inMiniPay ? `Pay with ${tokenSymbol}` : 'Open inside MiniPay to pay'
   const autoPay = state.autoPayAfterSession
   state.autoPayAfterSession = false
 
@@ -1855,14 +2137,15 @@ function renderPayment(main) {
       <h2 class="detail-title" style="font-size:17px">Payment</h2>
       <div class="meta-row"><span class="meta-label">Order</span><span class="meta-value">${escapeHtml(session.itemTitle || 'Items')}</span></div>
       <div class="meta-row"><span class="meta-label">Amount</span><span class="meta-value">${escapeHtml(session.amountDisplay || '—')}</span></div>
+      <div class="meta-row"><span class="meta-label">Token</span><span class="meta-value">${escapeHtml(tokenSymbol)}</span></div>
       <div class="meta-row"><span class="meta-label">Network</span><span class="meta-value">${escapeHtml(session.chainName || 'Celo')}</span></div>
       <div class="meta-row"><span class="meta-label">Delivery</span><span class="meta-value">Philippines only</span></div>
       <div class="meta-row"><span class="meta-label">Status</span><span class="meta-value" id="checkout-live-status">pending</span></div>
     </section>
     ${
       !inMiniPay
-        ? `<section class="card"><div class="alert alert-warn">Wallet signing is unavailable in a normal browser. Open inside MiniPay to pay with cUSD.</div></section>`
-        : `<section class="card"><div class="alert alert-info">MiniPay detected. Confirm cUSD payment below.</div><div class="meta-row" id="wallet-line" style="display:none"><span class="meta-label">Wallet</span><span class="meta-value" id="wallet-addr">—</span></div></section>`
+        ? `<section class="card"><div class="alert alert-warn">Wallet signing is unavailable in a normal browser. Open inside MiniPay to pay with crypto.</div></section>`
+        : `<section class="card"><div class="alert alert-info">MiniPay detected. Confirm ${escapeHtml(tokenSymbol)} payment below.</div><div class="meta-row" id="wallet-line" style="display:none"><span class="meta-label">Wallet</span><span class="meta-value" id="wallet-addr">—</span></div></section>`
     }
     <section class="card" id="payment-status-box">
       <div class="alert alert-info">Preparing payment…</div>
@@ -1881,7 +2164,7 @@ function renderPayment(main) {
   const payBtn = document.getElementById('confirm-pay-btn')
   if (!inMiniPay || !payBtn) {
     showPaymentStatus(
-      `<div class="alert alert-warn">Wallet signing is unavailable in a normal browser. Open inside MiniPay to pay with cUSD.</div>`,
+      `<div class="alert alert-warn">Wallet signing is unavailable in a normal browser. Open inside MiniPay to pay with crypto.</div>`,
     )
     return
   }
@@ -1912,6 +2195,9 @@ async function confirmMinipayPayment(session) {
   const walletAddrEl = document.getElementById('wallet-addr')
   const liveStatus = document.getElementById('checkout-live-status')
 
+  const tokenSymbol = session.tokenSymbol || getSelectedPaymentToken().symbol
+  const payLabel = `Pay with ${tokenSymbol}`
+
   const fail = (message, step) => {
     state.paymentInFlight = false
     setPaymentDebug({ step, lastError: message })
@@ -1919,13 +2205,13 @@ async function confirmMinipayPayment(session) {
     showPaymentStatus(`<div class="alert alert-error">${escapeHtml(message)}</div>`, { error: message })
     if (payBtn) {
       payBtn.disabled = false
-      payBtn.textContent = 'Pay with cUSD'
+      payBtn.textContent = payLabel
     }
   }
 
   if (!isMiniPayWallet()) {
     fail(
-      'Wallet signing is unavailable in a normal browser. Open inside MiniPay to pay with cUSD.',
+      'Wallet signing is unavailable in a normal browser. Open inside MiniPay to pay with crypto.',
       'blocked-not-minipay',
     )
     return
@@ -1978,7 +2264,7 @@ async function confirmMinipayPayment(session) {
       /* optional */
     }
 
-    showPaymentStatus(`<div class="alert alert-info">Checking cUSD balance…</div>`)
+    showPaymentStatus(`<div class="alert alert-info">Checking ${escapeHtml(tokenSymbol)} balance…</div>`)
     if (liveStatus) liveStatus.textContent = 'checking balance'
     setPaymentDebug({ step: 'balanceOf-started', lastError: null })
 
@@ -1991,11 +2277,10 @@ async function confirmMinipayPayment(session) {
         step: 'balanceOf-failed',
         lastError: String(balanceErr?.message ?? balanceErr),
       })
-      // If balance check fails, still block with friendly message rather than cryptic gas revert later
       fail(
         isDebugMode()
-          ? `Could not read cUSD balance: ${String(balanceErr?.message ?? balanceErr)}`
-          : 'Could not verify your cUSD balance. Please try again.',
+          ? `Could not read ${tokenSymbol} balance: ${String(balanceErr?.message ?? balanceErr)}`
+          : `Could not verify your ${tokenSymbol} balance. Please try again.`,
         'balanceOf-failed',
       )
       return
@@ -2007,14 +2292,15 @@ async function confirmMinipayPayment(session) {
       walletBalanceRaw: walletBalanceRaw.toString(),
       amountRaw: requiredRaw.toString(),
     })
-    logDebug('cUSD balanceOf', {
+    logDebug('token balanceOf', {
+      symbol: tokenSymbol,
       wallet: payer,
       balanceRaw: walletBalanceRaw.toString(),
       requiredRaw: requiredRaw.toString(),
     })
 
     if (walletBalanceRaw < requiredRaw) {
-      fail(INSUFFICIENT_CUSD_MESSAGE, 'insufficient-balance')
+      fail(insufficientTokenMessage(tokenSymbol), 'insufficient-balance')
       return
     }
 
@@ -2035,6 +2321,7 @@ async function confirmMinipayPayment(session) {
       from: txParams.from,
       chainId: txParams.chainId,
       amountRaw: String(session.amountRaw),
+      tokenSymbol,
       dataPrefix: dataHex.slice(0, 10),
     })
     setPaymentDebug({ step: 'eth_sendTransaction-started', lastError: null })
@@ -2054,21 +2341,53 @@ async function confirmMinipayPayment(session) {
     )
 
     setPaymentDebug({ step: 'verify-payment-started' })
-    const { status, data } = await invokeVerify({
-      session_id: session.sessionId,
-      session_token: session.sessionToken,
-      tx_hash: txHash,
-      payer_wallet_address: payer,
-    })
+    let verifyStatus
+    let verifyData
+    try {
+      const verified = await invokeVerify({
+        session_id: session.sessionId,
+        session_token: session.sessionToken,
+        tx_hash: txHash,
+        payer_wallet_address: payer,
+      })
+      verifyStatus = verified.status
+      verifyData = verified.data
+    } catch (verifyErr) {
+      logDebug('verify-payment network error', verifyErr)
+      setPaymentDebug({
+        step: 'verify-payment-network-error',
+        txHash: String(txHash),
+        lastError: isDebugMode() ? String(verifyErr?.message ?? verifyErr) : VERIFY_PENDING_MESSAGE,
+      })
+      state.paymentInFlight = false
+      showVerifyPendingRecovery(session, txHash, payer)
+      return
+    }
+
     setPaymentDebug({
       step: 'verify-payment-response',
-      verifyStatus: status,
-      txHash: data?.tx_hash || String(txHash),
+      verifyStatus,
+      txHash: verifyData?.tx_hash || String(txHash),
     })
-    logDebug('verify-payment response', { status, success: data?.success, paid: data?.status })
+    logDebug('verify-payment response', {
+      status: verifyStatus,
+      success: verifyData?.success,
+      paid: verifyData?.status,
+    })
 
-    if (!data?.success || data.status !== 'paid') {
-      throw new Error(friendlyApiError(status, data))
+    if (verifyStatus === 202 || verifyData?.status === 'submitted') {
+      state.paymentInFlight = false
+      showVerifyPendingRecovery(session, txHash, payer)
+      return
+    }
+
+    if (!verifyData?.success || verifyData.status !== 'paid') {
+      if (isVerifyPendingError(null, verifyStatus)) {
+        state.paymentInFlight = false
+        showVerifyPendingRecovery(session, txHash, payer)
+        return
+      }
+      throw new Error(friendlyApiError(verifyStatus, verifyData))
     }
 
     setPaymentDebug({ step: 'payment-successful', lastError: null })
@@ -2079,12 +2398,12 @@ async function confirmMinipayPayment(session) {
     setView('paid', {
       session: {
         ...session,
-        txHash: data.tx_hash || String(txHash),
-        explorerUrl: data.explorer_url,
-        receiptTxHash: data.receipt_tx_hash ?? null,
-        receiptExplorerUrl: data.receipt_explorer_url ?? null,
-        receiptPending: data.receipt_pending === true,
-        receiptRecorded: data.receipt_recorded === true || Boolean(data.receipt_tx_hash),
+        txHash: verifyData.tx_hash || String(txHash),
+        explorerUrl: verifyData.explorer_url,
+        receiptTxHash: verifyData.receipt_tx_hash ?? null,
+        receiptExplorerUrl: verifyData.receipt_explorer_url ?? null,
+        receiptPending: verifyData.receipt_pending === true,
+        receiptRecorded: verifyData.receipt_recorded === true || Boolean(verifyData.receipt_tx_hash),
       },
     })
     clearCart()
@@ -2099,10 +2418,17 @@ async function confirmMinipayPayment(session) {
       return
     }
     if (isInsufficientBalanceError(err)) {
-      fail(INSUFFICIENT_CUSD_MESSAGE, 'insufficient-balance')
+      fail(insufficientTokenMessage(tokenSymbol), 'insufficient-balance')
       return
     }
-    fail(friendlyPaymentError(err), 'payment-failed')
+    // If we already have a submitted tx in debug/state, prefer recovery UI.
+    const submittedTx = state.paymentDebug?.txHash || state.checkoutSession?.txHash
+    if (submittedTx && isVerifyPendingError(err)) {
+      state.paymentInFlight = false
+      showVerifyPendingRecovery(session, submittedTx, state.minipayWalletAddress)
+      return
+    }
+    fail(friendlyPaymentError(err, tokenSymbol), 'payment-failed')
   }
 }
 
@@ -2224,6 +2550,9 @@ function boot() {
   syncSearchPlaceholder()
   loadCatalog()
 
+  // Account link: consume ?link_token= then refresh summary from web session.
+  void consumeLinkTokenFromUrl().then(() => refreshLinkedAccountSummary({ silent: true }))
+
   if (window.ethereum && typeof window.ethereum.on === 'function') {
     window.ethereum.on('accountsChanged', syncWalletDetection)
     window.ethereum.on('chainChanged', syncWalletDetection)
@@ -2268,14 +2597,255 @@ function parseBoolean(value) {
   return null
 }
 
+function getStoredWebSession() {
+  try {
+    const raw = localStorage.getItem(WEB_SESSION_STORAGE_KEY)
+    if (!raw) return null
+    const parsed = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object') return null
+    const token = typeof parsed.session_token === 'string' ? parsed.session_token.trim() : ''
+    if (!token) return null
+    if (parsed.expires_at && new Date(parsed.expires_at).getTime() <= Date.now()) {
+      clearLinkedAccountLocal()
+      return null
+    }
+    return {
+      session_token: token,
+      expires_at: parsed.expires_at || null,
+    }
+  } catch (_) {
+    return null
+  }
+}
+
+function persistWebSession(sessionToken, expiresAt) {
+  try {
+    localStorage.setItem(
+      WEB_SESSION_STORAGE_KEY,
+      JSON.stringify({
+        session_token: sessionToken,
+        expires_at: expiresAt || null,
+      }),
+    )
+    localStorage.setItem(ACCOUNT_LINK_STORAGE_KEY, '1')
+  } catch (_) {
+    /* ignore quota */
+  }
+}
+
+function persistAccountSummary(account) {
+  if (!account || typeof account !== 'object') return
+  try {
+    sessionStorage.setItem(
+      ACCOUNT_SUMMARY_SESSION_KEY,
+      JSON.stringify({
+        energy_balance: account.energy_balance,
+        display_label: account.display_label,
+        digital_gear_count: account.digital_gear_count,
+        ronin_gear_count: account.ronin_gear_count,
+        base_gear_count: account.base_gear_count,
+        primary_gear_label: account.primary_gear_label,
+      }),
+    )
+    localStorage.setItem(ACCOUNT_LINK_STORAGE_KEY, '1')
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+function clearLinkedAccountLocal() {
+  try {
+    localStorage.removeItem(WEB_SESSION_STORAGE_KEY)
+    localStorage.removeItem(ACCOUNT_LINK_STORAGE_KEY)
+  } catch (_) {
+    /* ignore */
+  }
+  try {
+    sessionStorage.removeItem(ACCOUNT_SUMMARY_SESSION_KEY)
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+function stripLinkTokenFromUrl() {
+  try {
+    const url = new URL(window.location.href)
+    if (!url.searchParams.has('link_token')) return
+    url.searchParams.delete('link_token')
+    const next = `${url.pathname}${url.search}${url.hash}`
+    window.history.replaceState({}, document.title, next || url.pathname)
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+async function consumeLinkTokenFromUrl() {
+  const linkToken = qs('link_token')
+  if (!linkToken) return false
+
+  stripLinkTokenFromUrl()
+
+  const fn = cfg().linkVerifyFunction || 'marketplace-link-verify'
+  try {
+    const { status, data } = await invokeFunction(fn, { link_token: linkToken })
+    if (status >= 200 && status < 300 && data?.success && data.session_token && data.account) {
+      persistWebSession(data.session_token, data.expires_at)
+      persistAccountSummary(data.account)
+      syncAccountHeaderButton()
+      showToast('Move+ account linked.', null, null)
+      if (state.view === 'checkout') render()
+      return true
+    }
+    const msg =
+      (data && (data.error || data.message)) ||
+      'Could not link Move+ account. Open the marketplace from the Move+ app while signed in.'
+    showToast(String(msg), null, null)
+  } catch (err) {
+    showToast(err?.message || 'Could not link Move+ account.', null, null)
+  }
+  return false
+}
+
+async function refreshLinkedAccountSummary({ silent = false } = {}) {
+  const session = getStoredWebSession()
+  if (!session) {
+    syncAccountHeaderButton()
+    return null
+  }
+
+  const fn = cfg().accountSummaryFunction || 'marketplace-account-summary'
+  try {
+    const { status, data } = await invokeFunction(fn, {
+      session_token: session.session_token,
+    })
+    if (status >= 200 && status < 300 && data?.success && data.account) {
+      if (data.expires_at) persistWebSession(session.session_token, data.expires_at)
+      persistAccountSummary(data.account)
+      syncAccountHeaderButton()
+      if (state.view === 'checkout') render()
+      if (!silent) showToast('Account refreshed.', null, null)
+      return data.account
+    }
+    if (status === 401) {
+      clearLinkedAccountLocal()
+      syncAccountHeaderButton()
+      if (!silent) showToast('Session expired. Link your Move+ account again.', null, null)
+      if (state.view === 'checkout') render()
+    } else if (!silent) {
+      showToast((data && (data.error || data.message)) || 'Could not refresh account.', null, null)
+    }
+  } catch (err) {
+    if (!silent) showToast(err?.message || 'Could not refresh account.', null, null)
+  }
+  return null
+}
+
+async function disconnectLinkedAccount() {
+  const session = getStoredWebSession()
+  const fn = cfg().linkDisconnectFunction || 'marketplace-link-disconnect'
+  if (session?.session_token) {
+    try {
+      await invokeFunction(fn, { session_token: session.session_token })
+    } catch (_) {
+      /* local clear still proceeds */
+    }
+  }
+  clearLinkedAccountLocal()
+  syncAccountHeaderButton()
+  closeModal()
+  showToast('Move+ account disconnected on this browser.', null, null)
+  if (state.view === 'checkout') render()
+}
+
 function isMoveplusAccountLinked() {
   const configFlag = parseBoolean(cfg().moveplusAccountLinked)
   if (configFlag != null) return configFlag
+  if (getStoredWebSession()) return true
+  // Same-tab summary immediately after verify (before/while session persist).
   try {
-    return localStorage.getItem(ACCOUNT_LINK_STORAGE_KEY) === '1'
+    return Boolean(sessionStorage.getItem(ACCOUNT_SUMMARY_SESSION_KEY))
   } catch (_) {
     return false
   }
+}
+
+/**
+ * Safe linked-account summary only (Energy + display label + gear counts).
+ * Never stores email/phone/wallets in long-term localStorage.
+ * Prefer short-lived sessionStorage from link-verify; config can override for testing.
+ */
+function getLinkedAccountSummary() {
+  const linked = isMoveplusAccountLinked()
+  if (!linked) {
+    return {
+      linked: false,
+      energyBalance: null,
+      displayLabel: null,
+      digitalGearCount: null,
+      roninGearCount: null,
+      baseGearCount: null,
+      primaryGearLabel: null,
+    }
+  }
+
+  let energyBalance = null
+  let displayLabel = null
+  let digitalGearCount = null
+  let roninGearCount = null
+  let baseGearCount = null
+  let primaryGearLabel = null
+
+  const cfgBalance = cfg().moveplusEnergyBalance
+  if (cfgBalance != null && cfgBalance !== '' && Number.isFinite(Number(cfgBalance))) {
+    energyBalance = Math.max(0, Math.floor(Number(cfgBalance)))
+  }
+  if (typeof cfg().moveplusDisplayName === 'string' && cfg().moveplusDisplayName.trim()) {
+    displayLabel = cfg().moveplusDisplayName.trim().slice(0, 40)
+  }
+
+  try {
+    const raw = sessionStorage.getItem(ACCOUNT_SUMMARY_SESSION_KEY)
+    if (raw) {
+      const parsed = JSON.parse(raw)
+      if (parsed && typeof parsed === 'object') {
+        if (Number.isFinite(Number(parsed.energy_balance))) {
+          energyBalance = Math.max(0, Math.floor(Number(parsed.energy_balance)))
+        }
+        if (typeof parsed.display_label === 'string' && parsed.display_label.trim()) {
+          displayLabel = parsed.display_label.trim().slice(0, 40)
+        }
+        if (Number.isFinite(Number(parsed.digital_gear_count))) {
+          digitalGearCount = Math.max(0, Math.floor(Number(parsed.digital_gear_count)))
+        }
+        if (Number.isFinite(Number(parsed.ronin_gear_count))) {
+          roninGearCount = Math.max(0, Math.floor(Number(parsed.ronin_gear_count)))
+        }
+        if (Number.isFinite(Number(parsed.base_gear_count))) {
+          baseGearCount = Math.max(0, Math.floor(Number(parsed.base_gear_count)))
+        }
+        if (typeof parsed.primary_gear_label === 'string' && parsed.primary_gear_label.trim()) {
+          primaryGearLabel = parsed.primary_gear_label.trim().slice(0, 48)
+        }
+      }
+    }
+  } catch (_) {
+    /* ignore */
+  }
+
+  return {
+    linked: true,
+    energyBalance,
+    displayLabel,
+    digitalGearCount,
+    roninGearCount,
+    baseGearCount,
+    primaryGearLabel,
+  }
+}
+
+function formatEnergyBalanceLabel(balance) {
+  if (balance == null || !Number.isFinite(Number(balance))) return '—'
+  return Number(balance).toLocaleString()
 }
 
 function syncAccountHeaderButton() {
@@ -2312,35 +2882,120 @@ function buildAccountModalBody(leadText, noteTexts) {
 }
 
 function openMoveplusAccountSheet() {
-  const linked = isMoveplusAccountLinked()
+  const summary = getLinkedAccountSummary()
   const appUrl = cfg().moveplusAppDeepLink || cfg().moveplusHomeUrl || 'https://amayatoken.online/moveplus/'
 
-  if (linked) {
+  if (summary.linked) {
+    const notes = []
+    notes.push(
+      summary.energyBalance != null
+        ? `Energy balance: ${formatEnergyBalanceLabel(summary.energyBalance)}`
+        : 'Energy balance will appear here after sync.',
+    )
+    if (summary.digitalGearCount != null) {
+      notes.push(`Digital Gear: ${summary.digitalGearCount}`)
+    }
+    if (summary.roninGearCount != null || summary.baseGearCount != null) {
+      notes.push(
+        `Ronin ${summary.roninGearCount ?? 0} · Base ${summary.baseGearCount ?? 0}`,
+      )
+    }
+    if (summary.primaryGearLabel) {
+      notes.push(`Equipped: ${summary.primaryGearLabel}`)
+    }
+    notes.push('MiniPay crypto checkout is still available without Energy.')
+
     openModal({
-      title: 'Move+ Account',
-      bodyElement: buildAccountModalBody('Your Move+ account is linked.', [
-        'Energy balance and gear summary will appear here soon.',
-        'MiniPay checkout currently applies to Real Items only.',
-      ]),
-      primaryLabel: 'Open Move+ App',
-      primaryAction: () => openExternalUrl(appUrl),
-      secondaryLabel: 'Close',
-      secondaryAction: closeModal,
+      title: 'Move+ Account Connected',
+      bodyElement: buildAccountModalBody(
+        summary.displayLabel
+          ? `Signed in as ${summary.displayLabel}.`
+          : 'Your Move+ account is linked.',
+        notes,
+      ),
+      primaryLabel: 'Refresh',
+      primaryAction: () => {
+        void refreshLinkedAccountSummary({ silent: false }).then(() => {
+          if (isMoveplusAccountLinked()) openMoveplusAccountSheet()
+        })
+      },
+      secondaryLabel: 'Disconnect',
+      secondaryAction: () => {
+        void disconnectLinkedAccount()
+      },
     })
     return
   }
 
+  openLinkMoveplusAccountModal()
+}
+
+function openLinkMoveplusAccountModal() {
+  const appUrl = cfg().moveplusAppDeepLink || cfg().moveplusHomeUrl || 'https://amayatoken.online/moveplus/'
   openModal({
     title: 'Link Move+ Account',
     bodyElement: buildAccountModalBody(
-      'Link your Move+ account to view Energy balance and gear summary in this marketplace.',
-      ['Linking is coming soon.', 'MiniPay checkout currently applies to Real Items only.'],
+      'Link your Move+ account to pay with Energy Points and view your balance.',
+      [
+        'Open the web marketplace from the Move+ app while signed in to link securely.',
+        'MiniPay crypto checkout is still available without linking.',
+      ],
     ),
-    primaryLabel: 'Link Move+ Account',
-    primaryAction: () => showToast('Move+ account linking is coming soon.', null, null),
-    secondaryLabel: 'Close',
+    primaryLabel: 'Open Move+ App to Link',
+    primaryAction: () => openExternalUrl(appUrl),
+    secondaryLabel: 'Not now',
     secondaryAction: closeModal,
   })
+}
+
+function openEnergyComingSoonModal() {
+  const appUrl = cfg().moveplusAppDeepLink || cfg().moveplusHomeUrl || 'https://amayatoken.online/moveplus/'
+  openModal({
+    title: 'Pay with ENERGY',
+    bodyElement: buildAccountModalBody(
+      'Energy checkout on web is coming soon. You can redeem Energy inside the Move+ app.',
+      ['MiniPay USDT / USDC / cUSD checkout is available now for Real Items.'],
+    ),
+    primaryLabel: 'Open Move+ App',
+    primaryAction: () => openExternalUrl(appUrl),
+    secondaryLabel: 'Not now',
+    secondaryAction: closeModal,
+  })
+}
+
+function openInsufficientEnergyModal(balance, required) {
+  openModal({
+    title: 'Insufficient Energy',
+    bodyElement: buildAccountModalBody('Insufficient Energy balance.', [
+      `Your balance: ${formatEnergyBalanceLabel(balance)} ENERGY`,
+      `Cart total: ${formatEnergyBalanceLabel(required)} ENERGY`,
+      'Earn more Energy in the Move+ app, or pay with MiniPay (USDT / USDC / cUSD).',
+    ]),
+    primaryLabel: 'OK',
+    primaryAction: closeModal,
+    secondaryLabel: null,
+    secondaryAction: null,
+  })
+}
+
+function handleEnergyPayClick(requiredEnergy) {
+  const summary = getLinkedAccountSummary()
+
+  if (!summary.linked) {
+    openLinkMoveplusAccountModal()
+    return
+  }
+
+  const required = Math.max(0, Math.floor(Number(requiredEnergy) || 0))
+  const balance = summary.energyBalance
+
+  if (balance != null && Number.isFinite(balance) && balance < required) {
+    openInsufficientEnergyModal(balance, required)
+    return
+  }
+
+  // V1: no web Energy deduction — backend checkout not enabled yet.
+  openEnergyComingSoonModal()
 }
 
 function closeAllHeaderOverlays() {
