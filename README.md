@@ -9,8 +9,10 @@ Mobile-responsive web marketplace that mirrors the **Move+ native app marketplac
 | Item | Value |
 |------|--------|
 | Marketplace URL | https://amayatoken.online/moveplus/marketplace/ |
-| Payment token | cUSD (Celo mainnet) |
-| cUSD token address | `0x765DE816845861e75A25fCA122bb6898B8B1282a` |
+| Payment tokens | USDT, USDC, cUSD (Celo mainnet) — CELO is **not** a checkout currency |
+| USDT | `0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e` (6 decimals) |
+| USDC | `0xcebA9300f2b948710d2653dD7B07f33A8B32118C` (6 decimals) |
+| cUSD | `0x765DE816845861e75A25fCA122bb6898B8B1282a` (18 decimals) |
 | MovePlusMarketplacePayments contract | `0x5A49DA3337bBd589065cbd5d89090BDb06b51A18` |
 | Verified source (CeloScan) | https://celoscan.io/address/0x5A49DA3337bBd589065cbd5d89090BDb06b51A18#code |
 | Celo chain ID | `42220` |
@@ -18,7 +20,7 @@ Mobile-responsive web marketplace that mirrors the **Move+ native app marketplac
 
 ### Sample transaction
 
-Pending first live MiniPay/cUSD test.
+Pending first live MiniPay stablecoin test.
 
 When available, add a CeloScan tx link here for reviewer reference.
 
@@ -39,7 +41,7 @@ Other folders in this monorepo (Flutter app, minigame, Base onboarding) have the
 - Product catalog from `marketplace_items` (approved, in stock, not deleted)
 - Mobile-first UI (360×720 minimum), dark Move+ styling
 - Opens from Move+ app custom browser (optional feature flag)
-- **MiniPay cUSD payment** when `window.ethereum?.isMiniPay === true` (wallet auto-connect; no manual Connect Wallet button)
+- **MiniPay stablecoin payment** (USDT / USDC / cUSD) when `window.ethereum?.isMiniPay === true` (wallet auto-connect; no manual Connect Wallet button)
 - **Energy checkout** remains in the native Move+ app for now
 
 ## What this is not
@@ -132,13 +134,16 @@ When enabled, Marketplace screen shows a web icon that opens this URL in custom 
 
 - Provider auto-detected on page load
 - Wallet prepared automatically (no **Connect Wallet** button)
-- Checkout / payment button: **Pay with cUSD**
+- Stablecoin selector: **USDT / USDC / cUSD** (same USD product price)
+- Default preference: token with enough balance, else USDT → USDC → cUSD
+- Checkout button: **Pay with USDT** / **Pay with USDC** / **Pay with cUSD**
 - User confirms ERC-20 transfer in MiniPay
+- Product `crypto_price` is a USD stablecoin amount (e.g. `0.01` → USDT/USDC raw `10000`, cUSD raw `10000000000000000`)
 
 ### Normal browser
 
 - Catalog and Energy info work
-- Graceful message: *Wallet signing is unavailable in a normal browser. Open inside MiniPay to pay with cUSD.*
+- Graceful message: *Wallet signing is unavailable in a normal browser. Open inside MiniPay to pay with crypto.*
 - No broken manual wallet-connect flow
 
 ## Testing
@@ -154,9 +159,9 @@ When enabled, Marketplace screen shows a web icon that opens this URL in custom 
 
 1. Open URL inside MiniPay wallet browser
 2. Wallet auto-connects on load
-3. Complete checkout form → **Pay with cUSD**
-4. Confirm Celo cUSD transfer
-5. Backend verifies → paid state
+3. Choose USDT, USDC, or cUSD → complete checkout → **Pay with {token}**
+4. Confirm Celo ERC-20 transfer
+5. Backend verifies against server-stored token address/amount → paid state
 
 ### C. Move+ app
 
@@ -171,11 +176,11 @@ Add `debug=1` to URL (`&debug=1` if query params exist). Shows provider status w
 
 ## Energy payments
 
-Web displays Energy price as information only. Message shown:
+Web can **link** a Move+ account (via one-time app `link_token`) and show Energy balance + Digital Gear summary.
 
-> Energy redemption is available inside the Move+ app.
+Web **does not deduct Energy** in v1. Pay with ENERGY shows “coming soon” when linked with sufficient balance. Native `createPurchase()` remains the Energy spend path inside the Move+ app.
 
-No web Energy deduction in v1.
+MiniPay USDT / USDC / cUSD checkout is unchanged and works without linking.
 
 ## Related folders
 
