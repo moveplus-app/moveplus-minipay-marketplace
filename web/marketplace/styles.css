@@ -473,6 +473,92 @@ body {
   font-size: 12px;
 }
 
+.auth-link-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.auth-tabs {
+  display: flex;
+  gap: 6px;
+  margin: 4px 0 2px;
+}
+
+.auth-tab {
+  flex: 1;
+  min-height: 40px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 8px 10px;
+}
+
+.auth-tab.active {
+  border-color: rgba(123, 218, 0, 0.55);
+  color: var(--accent);
+  background: #1f2a14;
+}
+
+.auth-panel.hidden {
+  display: none;
+}
+
+.auth-fields .form-group {
+  margin-bottom: 10px;
+}
+
+.auth-fields .form-group label {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.auth-fields .form-group input {
+  width: 100%;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: #1f1f1f;
+  color: var(--text);
+  padding: 10px 12px;
+  font-size: 14px;
+}
+
+.auth-otp-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.auth-status {
+  min-height: 18px;
+  font-size: 13px;
+  line-height: 1.35;
+  color: var(--muted);
+}
+
+.auth-status-error {
+  color: var(--danger);
+}
+
+.auth-status-ok {
+  color: var(--accent);
+}
+
+.auth-google-note {
+  margin-top: 4px;
+}
+
+.auth-link-form code {
+  font-size: 11px;
+  color: var(--text);
+}
+
 .modal-actions {
   display: flex;
   flex-direction: column;
@@ -866,6 +952,50 @@ body {
   color: #ffc2c2;
 }
 
+.token-selector {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.token-selector-label {
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.token-selector-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.token-chip {
+  min-height: 40px;
+  min-width: 72px;
+  padding: 8px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.token-chip.active {
+  border-color: var(--accent);
+  background: rgba(123, 218, 0, 0.12);
+  color: var(--accent);
+}
+
+.token-selector-hint {
+  margin: 8px 0 0;
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.4;
+}
+
 .form-group {
   margin-bottom: 12px;
 }
@@ -921,6 +1051,22 @@ body {
   background: transparent;
   color: var(--text);
   border: 1px solid var(--border);
+}
+
+.btn-energy {
+  background: #1f2a14;
+  color: var(--accent);
+  border: 1px solid rgba(123, 218, 0, 0.55);
+}
+
+.btn-energy:active {
+  background: #243318;
+}
+
+.muted-inline {
+  color: var(--muted);
+  font-weight: 500;
+  font-size: 0.92em;
 }
 
 .btn-ghost {
