@@ -96,7 +96,6 @@ const ACCOUNT_LINK_STORAGE_KEY = 'moveplus_marketplace_account_linked_v1'
 const ACCOUNT_SUMMARY_SESSION_KEY = 'moveplus_marketplace_account_summary_v1'
 const WEB_SESSION_STORAGE_KEY = 'moveplus_marketplace_web_session_v1'
 const ACCOUNT_LINK_ICON_PATH = './assets/icons/link-svgrepo-com.svg'
-const ACCOUNT_WALLET_ICON_PATH = './assets/icons/wallet-2-svgrepo-com.svg'
 
 function qs(name) {
   return new URLSearchParams(window.location.search).get(name)?.trim() ?? ''
@@ -2550,8 +2549,8 @@ function boot() {
   syncSearchPlaceholder()
   loadCatalog()
 
-  // Account link: consume ?link_token= then refresh summary from web session.
-  void consumeLinkTokenFromUrl().then(() => refreshLinkedAccountSummary({ silent: true }))
+  // Account link: refresh marketplace capability session (no Supabase JWT retained).
+  void refreshLinkedAccountSummary({ silent: true })
 
   if (window.ethereum && typeof window.ethereum.on === 'function') {
     window.ethereum.on('accountsChanged', syncWalletDetection)
@@ -2667,7 +2666,7 @@ function clearLinkedAccountLocal() {
   }
 }
 
-function stripLinkTokenFromUrl() {
+function stripStaleLinkTokenFromUrl() {
   try {
     const url = new URL(window.location.href)
     if (!url.searchParams.has('link_token')) return
@@ -2679,34 +2678,134 @@ function stripLinkTokenFromUrl() {
   }
 }
 
-async function consumeLinkTokenFromUrl() {
-  const linkToken = qs('link_token')
-  if (!linkToken) return false
-
-  stripLinkTokenFromUrl()
-
-  const fn = cfg().linkVerifyFunction || 'marketplace-link-verify'
+async function invokeFunctionWithUserJwt(name, accessToken, body = {}) {
+  const c = cfg()
+  const url = `${c.supabaseUrl}/functions/v1/${name}`
+  let res
   try {
-    const { status, data } = await invokeFunction(fn, { link_token: linkToken })
-    if (status >= 200 && status < 300 && data?.success && data.session_token && data.account) {
-      persistWebSession(data.session_token, data.expires_at)
-      persistAccountSummary(data.account)
-      syncAccountHeaderButton()
-      showToast('Move+ account linked.', null, null)
-      if (state.view === 'checkout') render()
-      return true
-    }
-    const msg =
-      (data && (data.error || data.message)) ||
-      'Could not link Move+ account. Open the marketplace from the Move+ app while signed in.'
-    showToast(String(msg), null, null)
+    res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        apikey: c.supabaseAnonKey,
+        Authorization: `Bearer ${accessToken}`,
+      },
+      body: JSON.stringify(body),
+    })
   } catch (err) {
-    showToast(err?.message || 'Could not link Move+ account.', null, null)
+    throw new Error(friendlyFetchError(err))
   }
-  return false
+  const data = await res.json().catch(() => ({}))
+  return { status: res.status, data }
+}
+
+async function supabaseAuthRequest(path, body, { accessToken } = {}) {
+  const c = cfg()
+  if (!c.supabaseUrl || !c.supabaseAnonKey) {
+    throw new Error('Marketplace config missing Supabase URL / anon key.')
+  }
+  const url = `${c.supabaseUrl}/auth/v1/${path}`
+  const headers = {
+    'Content-Type': 'application/json',
+    apikey: c.supabaseAnonKey,
+  }
+  if (accessToken) headers.Authorization = `Bearer ${accessToken}`
+  let res
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+    })
+  } catch (err) {
+    throw new Error(friendlyFetchError(err))
+  }
+  const data = await res.json().catch(() => ({}))
+  return { status: res.status, data }
+}
+
+function authErrorMessage(data, fallback) {
+  if (!data || typeof data !== 'object') return fallback
+  const msg = data.error_description || data.msg || data.message || data.error
+  if (typeof msg === 'string' && msg.trim()) return msg.trim()
+  return fallback
+}
+
+async function signInWithEmailPassword(email, password) {
+  const { status, data } = await supabaseAuthRequest('token?grant_type=password', {
+    email,
+    password,
+  })
+  if (status < 200 || status >= 300 || !data?.access_token) {
+    throw new Error(authErrorMessage(data, 'Invalid email or password.'))
+  }
+  return data
+}
+
+async function sendEmailOtp(email) {
+  const { status, data } = await supabaseAuthRequest('otp', {
+    email,
+    create_user: false,
+  })
+  if (status < 200 || status >= 300) {
+    throw new Error(
+      authErrorMessage(
+        data,
+        'Could not send code. Use an existing Move+ account email, or try password login.',
+      ),
+    )
+  }
+  return true
+}
+
+async function verifyEmailOtp(email, token) {
+  const { status, data } = await supabaseAuthRequest('verify', {
+    email,
+    token,
+    type: 'email',
+  })
+  if (status < 200 || status >= 300 || !data?.access_token) {
+    throw new Error(authErrorMessage(data, 'Invalid or expired code.'))
+  }
+  return data
+}
+
+async function clearSupabaseAuthSession(accessToken) {
+  if (!accessToken) return
+  try {
+    await supabaseAuthRequest('logout', {}, { accessToken })
+  } catch (_) {
+    /* best effort */
+  }
+}
+
+async function mintMarketplaceSessionFromAccessToken(accessToken) {
+  const fn = cfg().webAuthSessionFunction || 'marketplace-web-auth-session'
+  const { status, data } = await invokeFunctionWithUserJwt(fn, accessToken, {})
+  if (status < 200 || status >= 300 || !data?.success || !data.session_token || !data.account) {
+    throw new Error(
+      (data && (data.error || data.message)) || 'Could not create marketplace session.',
+    )
+  }
+  persistWebSession(data.session_token, data.expires_at)
+  persistAccountSummary(data.account)
+  syncAccountHeaderButton()
+  if (state.view === 'checkout') render()
+  return data.account
+}
+
+async function completeMarketplaceLogin(authPayload) {
+  const accessToken = authPayload?.access_token
+  if (!accessToken) throw new Error('Missing auth token.')
+  try {
+    await mintMarketplaceSessionFromAccessToken(accessToken)
+  } finally {
+    await clearSupabaseAuthSession(accessToken)
+  }
 }
 
 async function refreshLinkedAccountSummary({ silent = false } = {}) {
+  stripStaleLinkTokenFromUrl()
   const session = getStoredWebSession()
   if (!session) {
     syncAccountHeaderButton()
@@ -2729,7 +2828,7 @@ async function refreshLinkedAccountSummary({ silent = false } = {}) {
     if (status === 401) {
       clearLinkedAccountLocal()
       syncAccountHeaderButton()
-      if (!silent) showToast('Session expired. Link your Move+ account again.', null, null)
+      if (!silent) showToast('Session expired. Sign in again to link your Move+ account.', null, null)
       if (state.view === 'checkout') render()
     } else if (!silent) {
       showToast((data && (data.error || data.message)) || 'Could not refresh account.', null, null)
@@ -2761,7 +2860,6 @@ function isMoveplusAccountLinked() {
   const configFlag = parseBoolean(cfg().moveplusAccountLinked)
   if (configFlag != null) return configFlag
   if (getStoredWebSession()) return true
-  // Same-tab summary immediately after verify (before/while session persist).
   try {
     return Boolean(sessionStorage.getItem(ACCOUNT_SUMMARY_SESSION_KEY))
   } catch (_) {
@@ -2772,7 +2870,6 @@ function isMoveplusAccountLinked() {
 /**
  * Safe linked-account summary only (Energy + display label + gear counts).
  * Never stores email/phone/wallets in long-term localStorage.
- * Prefer short-lived sessionStorage from link-verify; config can override for testing.
  */
 function getLinkedAccountSummary() {
   const linked = isMoveplusAccountLinked()
@@ -2848,19 +2945,45 @@ function formatEnergyBalanceLabel(balance) {
   return Number(balance).toLocaleString()
 }
 
+function isEmailOtpLoginEnabled() {
+  const flag = parseBoolean(cfg().enableEmailOtpLogin)
+  return flag === true
+}
+
+function accountWalletIconSvg() {
+  return `
+    <svg class="header-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d="" stroke="currentColor" stroke-width="1.6" />
+      <path d="" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" />
+      <path d="M8 10.5v3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+    </svg>
+  `.trim()
+}
+
+function accountLinkIconHtml() {
+  return `
+    <img
+      id="account-header-icon"
+      class="header-icon account-icon-img original-color"
+      src="${ACCOUNT_LINK_ICON_PATH}"
+      alt=""
+      loading="lazy"
+      decoding="async"
+    />
+  `.trim()
+}
+
 function syncAccountHeaderButton() {
   const btn = document.getElementById('btn-account')
-  const icon = document.getElementById('account-header-icon')
-  if (!btn || !icon) return
+  if (!btn) return
 
   const linked = isMoveplusAccountLinked()
-  icon.classList.add('account-icon-img', 'original-color')
   if (linked) {
-    icon.src = ACCOUNT_WALLET_ICON_PATH
+    btn.innerHTML = accountWalletIconSvg()
     btn.setAttribute('aria-label', 'Move+ Account')
     btn.setAttribute('title', 'Move+ Account')
   } else {
-    icon.src = ACCOUNT_LINK_ICON_PATH
+    btn.innerHTML = accountLinkIconHtml()
     btn.setAttribute('aria-label', 'Link Move+ Account')
     btn.setAttribute('title', 'Link Move+ Account')
   }
@@ -2881,9 +3004,203 @@ function buildAccountModalBody(leadText, noteTexts) {
   return container
 }
 
+function setAuthFormStatus(el, message, isError) {
+  if (!el) return
+  el.textContent = message || ''
+  el.classList.toggle('auth-status-error', Boolean(isError && message))
+  el.classList.toggle('auth-status-ok', Boolean(!isError && message))
+}
+
+function buildLinkLoginForm() {
+  const wrap = document.createElement('div')
+  wrap.className = 'auth-link-form'
+  const otpEnabled = isEmailOtpLoginEnabled()
+
+  const lead = document.createElement('p')
+  lead.className = 'modal-lead'
+  lead.textContent =
+    'Sign in to your existing Move+ account to view Energy balance and gear summary.'
+  wrap.appendChild(lead)
+
+  const note = document.createElement('p')
+  note.className = 'modal-note'
+  note.textContent = 'MiniPay crypto checkout is still available without linking.'
+  wrap.appendChild(note)
+
+  if (otpEnabled) {
+    const tabs = document.createElement('div')
+    tabs.className = 'auth-tabs'
+    tabs.setAttribute('role', 'tablist')
+    tabs.innerHTML = `
+      <button type="button" class="auth-tab active" data-auth-tab="password" role="tab" aria-selected="true">Email / Password</button>
+      <button type="button" class="auth-tab" data-auth-tab="otp" role="tab" aria-selected="false">Email code</button>
+    `
+    wrap.appendChild(tabs)
+  }
+
+  const status = document.createElement('div')
+  status.className = 'auth-status'
+  status.id = 'auth-link-status'
+  wrap.appendChild(status)
+
+  const passwordPanel = document.createElement('div')
+  passwordPanel.className = 'auth-panel'
+  passwordPanel.dataset.authPanel = 'password'
+  passwordPanel.innerHTML = `
+    <form id="auth-password-form" class="auth-fields" autocomplete="on">
+      <div class="form-group">
+        <label for="auth-email">Email</label>
+        <input id="auth-email" name="email" type="email" required autocomplete="username" inputmode="email" />
+      </div>
+      <div class="form-group">
+        <label for="auth-password">Password</label>
+        <input id="auth-password" name="password" type="password" required autocomplete="current-password" />
+      </div>
+      <button type="submit" class="btn btn-primary" id="auth-password-submit">Sign in</button>
+    </form>
+  `
+  wrap.appendChild(passwordPanel)
+
+  let otpPanel = null
+  if (otpEnabled) {
+    otpPanel = document.createElement('div')
+    otpPanel.className = 'auth-panel hidden'
+    otpPanel.dataset.authPanel = 'otp'
+    otpPanel.innerHTML = `
+      <form id="auth-otp-form" class="auth-fields" autocomplete="on">
+        <div class="form-group">
+          <label for="auth-otp-email">Email</label>
+          <input id="auth-otp-email" name="email" type="email" required autocomplete="username" inputmode="email" />
+        </div>
+        <div class="form-group">
+          <label for="auth-otp-code">Code</label>
+          <input id="auth-otp-code" name="token" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="12" placeholder="Enter numeric code from email" />
+        </div>
+        <div class="auth-otp-actions">
+          <button type="button" class="btn btn-secondary" id="auth-otp-send">Send code</button>
+          <button type="submit" class="btn btn-primary" id="auth-otp-submit">Verify &amp; link</button>
+        </div>
+      </form>
+      <p class="modal-note">Your Supabase Magic Link email template must include <code>{{ .Token }}</code> so a visible code is sent. Magic links are not used in MiniPay.</p>
+    `
+    wrap.appendChild(otpPanel)
+  } else {
+    const otpDisabledNote = document.createElement('p')
+    otpDisabledNote.className = 'modal-note'
+    otpDisabledNote.textContent =
+      'Email code login is unavailable until the Supabase email template includes a visible OTP code ({{ .Token }}). Use Email / Password for now.'
+    wrap.appendChild(otpDisabledNote)
+  }
+
+  const googleNote = document.createElement('p')
+  googleNote.className = 'modal-note auth-google-note'
+  googleNote.textContent = 'Continue with Google will be available later if supported inside MiniPay.'
+  wrap.appendChild(googleNote)
+
+  let busy = false
+
+  const setBusy = (next) => {
+    busy = next
+    wrap.querySelectorAll('button, input').forEach((el) => {
+      el.disabled = next
+    })
+  }
+
+  if (otpEnabled) {
+    wrap.querySelectorAll('[data-auth-tab]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        if (busy) return
+        const tab = btn.getAttribute('data-auth-tab')
+        wrap.querySelectorAll('[data-auth-tab]').forEach((b) => {
+          const on = b === btn
+          b.classList.toggle('active', on)
+          b.setAttribute('aria-selected', on ? 'true' : 'false')
+        })
+        wrap.querySelectorAll('[data-auth-panel]').forEach((panel) => {
+          panel.classList.toggle('hidden', panel.getAttribute('data-auth-panel') !== tab)
+        })
+        setAuthFormStatus(status, '', false)
+      })
+    })
+  }
+
+  passwordPanel.querySelector('#auth-password-form')?.addEventListener('submit', async (e) => {
+    e.preventDefault()
+    if (busy) return
+    const email = passwordPanel.querySelector('#auth-email')?.value?.trim() || ''
+    const password = passwordPanel.querySelector('#auth-password')?.value || ''
+    if (!email || !password) {
+      setAuthFormStatus(status, 'Enter email and password.', true)
+      return
+    }
+    setBusy(true)
+    setAuthFormStatus(status, 'Signing in…', false)
+    try {
+      const authPayload = await signInWithEmailPassword(email, password)
+      await completeMarketplaceLogin(authPayload)
+      closeModal()
+      showToast('Move+ account linked.', null, null)
+    } catch (err) {
+      setAuthFormStatus(status, err?.message || 'Sign in failed.', true)
+    } finally {
+      setBusy(false)
+    }
+  })
+
+  if (otpEnabled && otpPanel) {
+    otpPanel.querySelector('#auth-otp-send')?.addEventListener('click', async () => {
+      if (busy) return
+      const email = otpPanel.querySelector('#auth-otp-email')?.value?.trim() || ''
+      if (!email) {
+        setAuthFormStatus(status, 'Enter your Move+ account email.', true)
+        return
+      }
+      setBusy(true)
+      setAuthFormStatus(status, 'Sending code…', false)
+      try {
+        await sendEmailOtp(email)
+        setAuthFormStatus(status, 'Code sent. Enter the numeric code from your email.', false)
+        otpPanel.querySelector('#auth-otp-code')?.focus()
+      } catch (err) {
+        setAuthFormStatus(status, err?.message || 'Could not send code.', true)
+      } finally {
+        setBusy(false)
+      }
+    })
+
+    otpPanel.querySelector('#auth-otp-form')?.addEventListener('submit', async (e) => {
+      e.preventDefault()
+      if (busy) return
+      const email = otpPanel.querySelector('#auth-otp-email')?.value?.trim() || ''
+      const token = otpPanel.querySelector('#auth-otp-code')?.value?.trim() || ''
+      if (!email || !token) {
+        setAuthFormStatus(status, 'Enter email and the code from your inbox.', true)
+        return
+      }
+      if (!/^\d{6,12}$/.test(token)) {
+        setAuthFormStatus(status, 'Enter the numeric code from the email (not a link).', true)
+        return
+      }
+      setBusy(true)
+      setAuthFormStatus(status, 'Verifying…', false)
+      try {
+        const authPayload = await verifyEmailOtp(email, token)
+        await completeMarketplaceLogin(authPayload)
+        closeModal()
+        showToast('Move+ account linked.', null, null)
+      } catch (err) {
+        setAuthFormStatus(status, err?.message || 'Verification failed.', true)
+      } finally {
+        setBusy(false)
+      }
+    })
+  }
+
+  return wrap
+}
+
 function openMoveplusAccountSheet() {
   const summary = getLinkedAccountSummary()
-  const appUrl = cfg().moveplusAppDeepLink || cfg().moveplusHomeUrl || 'https://amayatoken.online/moveplus/'
 
   if (summary.linked) {
     const notes = []
@@ -2931,35 +3248,27 @@ function openMoveplusAccountSheet() {
 }
 
 function openLinkMoveplusAccountModal() {
-  const appUrl = cfg().moveplusAppDeepLink || cfg().moveplusHomeUrl || 'https://amayatoken.online/moveplus/'
   openModal({
     title: 'Link Move+ Account',
-    bodyElement: buildAccountModalBody(
-      'Link your Move+ account to pay with Energy Points and view your balance.',
-      [
-        'Open the web marketplace from the Move+ app while signed in to link securely.',
-        'MiniPay crypto checkout is still available without linking.',
-      ],
-    ),
-    primaryLabel: 'Open Move+ App to Link',
-    primaryAction: () => openExternalUrl(appUrl),
+    bodyElement: buildLinkLoginForm(),
+    primaryLabel: null,
+    primaryAction: null,
     secondaryLabel: 'Not now',
     secondaryAction: closeModal,
   })
 }
 
 function openEnergyComingSoonModal() {
-  const appUrl = cfg().moveplusAppDeepLink || cfg().moveplusHomeUrl || 'https://amayatoken.online/moveplus/'
   openModal({
     title: 'Pay with ENERGY',
     bodyElement: buildAccountModalBody(
       'Energy checkout on web is coming soon. You can redeem Energy inside the Move+ app.',
       ['MiniPay USDT / USDC / cUSD checkout is available now for Real Items.'],
     ),
-    primaryLabel: 'Open Move+ App',
-    primaryAction: () => openExternalUrl(appUrl),
-    secondaryLabel: 'Not now',
-    secondaryAction: closeModal,
+    primaryLabel: 'OK',
+    primaryAction: closeModal,
+    secondaryLabel: null,
+    secondaryAction: null,
   })
 }
 
