@@ -176,7 +176,9 @@ Add `debug=1` to URL (`&debug=1` if query params exist). Shows provider status w
 
 ## Energy payments
 
-Web can **link** a Move+ account (via one-time app `link_token`) and show Energy balance + Digital Gear summary.
+Web can **link** a Move+ account directly inside the MiniPay Mini App / marketplace via Supabase Auth (**Email / Password**).
+
+**Email code (OTP)** is disabled by default (`enableEmailOtpLogin: false`). Enable only after the Supabase Auth email template includes a visible numeric token (`{{ .Token }}`). Do not rely on magic-link-only emails inside MiniPay — links may open outside the webview.
 
 Web **does not deduct Energy** in v1. Pay with ENERGY shows “coming soon” when linked with sufficient balance. Native `createPurchase()` remains the Energy spend path inside the Move+ app.
 
