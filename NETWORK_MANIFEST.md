@@ -31,12 +31,16 @@ Edge functions used by MiniPay checkout (public names only):
 
 Edge functions used by Move+ account linking (public names only):
 
-- `create-marketplace-link-session` (authenticated app JWT)
-- `marketplace-link-verify` (one-time `link_token`)
+- `marketplace-web-auth-session` (Supabase user JWT once after Mini App login)
 - `marketplace-account-summary` (marketplace web session token)
 - `marketplace-link-disconnect` (marketplace web session token)
 
-The browser uses the **Supabase anon key** only. The **service role key is never exposed** to the frontend. Account link never puts a Supabase JWT in the URL.
+Legacy (unused by current Mini App direct login; kept for rollback only):
+
+- `create-marketplace-link-session`
+- `marketplace-link-verify`
+
+The browser uses the **Supabase anon key** only. The **service role key is never exposed** to the frontend. After login, the Supabase JWT is used once to mint a marketplace session, then cleared — marketplace calls use the opaque session token only.
 
 ## Celo / MiniPay
 
