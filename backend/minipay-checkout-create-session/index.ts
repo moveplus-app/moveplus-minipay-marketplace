@@ -1,8 +1,9 @@
 /**
  * Create hosted MiniPay marketplace checkout session.
- * Does NOT deduct Energy. Raw session token returned once; DB stores hash only.
+ * Energy may reduce remaining stablecoin as a server-calculated discount only.
+ * When discount > 0, Energy is reserved atomically here (balance deducted + hold row).
+ * verify-payment redeems the reservation; expire/fail releases it.
  */
-
 
 import {
   buildCheckoutUrl,
@@ -10,6 +11,8 @@ import {
   generateRawSessionToken,
   loadMinipayCeloConfig,
   parseUnitsDecimal,
+  getDefaultMinipayTokenSymbol,
+  resolveMinipayToken,
   sha256Hex,
 } from './minipay_celo.ts'
 import { safeError, safeLog } from './log_sanitize.ts'
@@ -18,6 +21,16 @@ import {
   RATE_LIMIT_ERROR,
   readClientIpForRateLimit,
 } from './rate_limit.ts'
+import { isOfferExpiredRow, OFFER_EXPIRED_ERROR } from './marketplace_offer.ts'
+import {
+  calculateEnergyDiscount,
+  mergeProductDiscountFlags,
+  parsePaymentSettingsRow,
+} from './energy_discount.ts'
+import {
+  ENERGY_BALANCE_CHANGED_ERROR,
+  parseEnergyReservationRpc,
+} from './energy_reservation.ts'
 
 const SESSION_TTL_MS = 15 * 60 * 1000
 
@@ -71,16 +84,6 @@ function isDemoCheckoutMode(): boolean {
 
 function decimalAmountString(amount: number, decimals: number): string {
   return amount.toFixed(Math.min(8, decimals)).replace(/\.?0+$/, '') || '0'
-}
-
-function tokenMatchesConfigured(
-  productToken: string,
-  configuredToken: string,
-): boolean {
-  const product = productToken.trim()
-  const configured = configuredToken.trim()
-  if (!product || !configured) return false
-  return product.toUpperCase() === configured.toUpperCase()
 }
 
 function parseCartLineInputs(body: Record<string, unknown>): CartLineInput[] {
@@ -180,11 +183,23 @@ serve(async (req) => {
       return json({ success: false, error: 'Invalid email' }, 400)
     }
 
+    // Client sends symbol only — server resolves address/decimals from allowlist/registry.
+    // crypto_price is USD stable face value; product.crypto_currency is display-only (not a blocker).
+    const requestedSymbol =
+      body.payment_token_symbol ?? body.token_symbol ?? getDefaultMinipayTokenSymbol()
+    const paymentToken = resolveMinipayToken(requestedSymbol)
+    if (!paymentToken) {
+      return json({
+        success: false,
+        error: 'Unsupported payment token. Use cUSD, USDT, or USDC.',
+      }, 400)
+    }
+
     const ids = cartInputs.map((line) => line.id)
     const { data: itemRows, error: itemsErr } = await admin
       .from('marketplace_items')
       .select(
-        'id, title, is_available, is_deleted, stock_quantity, energy_points_price, crypto_price, crypto_currency',
+        'id, title, is_available, is_deleted, stock_quantity, energy_points_price, crypto_price, crypto_currency, is_limited_offer, offer_ends_at, allow_energy_discount, max_energy_discount_percent, allow_full_energy_payment',
       )
       .in('id', ids)
 
@@ -192,6 +207,50 @@ serve(async (req) => {
       safeError('minipay_create_items_fetch_failed', { message: itemsErr.message })
       return json({ success: false, error: 'Could not load products' }, 500)
     }
+
+    const { data: settingsRow } = await admin
+      .from('marketplace_payment_settings')
+      .select(
+        'energy_php_value, php_per_cusd, max_energy_discount_percent, max_energy_discount_amount_php, allow_full_energy_payment',
+      )
+      .limit(1)
+      .maybeSingle()
+    const paymentSettings = parsePaymentSettingsRow(settingsRow as Record<string, unknown> | null)
+
+    // Move+ marketplace capability session (not Supabase JWT). Required for Energy discount.
+    const marketplaceSessionToken = trimField(body.marketplace_session_token, 128)
+    let moveplusUserId: string | null = null
+    let userEnergyBalance: number | null = null
+    if (marketplaceSessionToken.length >= 32) {
+      const sessionHash = await sha256Hex(marketplaceSessionToken)
+      const { data: webSession } = await admin
+        .from('marketplace_web_sessions')
+        .select('id, user_id, expires_at, revoked_at')
+        .eq('session_hash', sessionHash)
+        .maybeSingle()
+      if (
+        webSession &&
+        !webSession.revoked_at &&
+        new Date(String(webSession.expires_at)).getTime() > Date.now()
+      ) {
+        moveplusUserId = String(webSession.user_id)
+        const { data: profile } = await admin
+          .from('users')
+          .select('energy_points')
+          .eq('id', moveplusUserId)
+          .maybeSingle()
+        userEnergyBalance = Math.max(0, Math.floor(Number(profile?.energy_points ?? 0) || 0))
+        await admin
+          .from('marketplace_web_sessions')
+          .update({ last_seen_at: new Date().toISOString() })
+          .eq('id', webSession.id)
+      }
+    }
+
+    const requestedEnergyDiscount = Math.max(
+      0,
+      Math.floor(Number(body.requested_energy_discount ?? body.energy_to_apply ?? 0) || 0),
+    )
 
     const itemById = new Map(
       (itemRows ?? []).map((row) => [String(row.id), row]),
@@ -201,8 +260,11 @@ serve(async (req) => {
     let totalQuantity = 0
     let energyPointsTotal = 0
     let totalCryptoRaw = 0n
+    let totalCryptoFace = 0
     const demoMode = isDemoCheckoutMode()
-    const configuredToken = celoConfig.tokenSymbol.trim()
+    const tokenDecimals = paymentToken.decimals
+    const tokenSymbol = paymentToken.symbol
+    const tokenAddress = paymentToken.address.toLowerCase()
 
     for (const line of cartInputs) {
       const item = itemById.get(line.id)
@@ -211,6 +273,10 @@ serve(async (req) => {
       }
       if (item.is_deleted === true || item.is_available !== true) {
         return json({ success: false, error: `Product unavailable: ${item.title ?? line.id}` }, 400)
+      }
+
+      if (isOfferExpiredRow(item)) {
+        return json({ success: false, error: OFFER_EXPIRED_ERROR }, 400)
       }
 
       const stock = readStockQuantity(item.stock_quantity)
@@ -227,8 +293,8 @@ serve(async (req) => {
         }, 400)
       }
 
+      // crypto_price is USD stablecoin price (same numeric value for USDT/USDC/cUSD).
       let unitPrice = readPositiveDecimal(item.crypto_price)
-      const productToken = String(item.crypto_currency ?? '').trim()
 
       if (!demoMode) {
         if (unitPrice == null) {
@@ -237,37 +303,17 @@ serve(async (req) => {
             error: `Product missing crypto price: ${item.title ?? line.id}`,
           }, 400)
         }
-        if (!tokenMatchesConfigured(productToken, configuredToken)) {
-          return json({
-            success: false,
-            error: 'Product payment currency is not supported for this checkout.',
-          }, 400)
-        }
-      } else {
-        if (unitPrice == null) {
-          unitPrice = Number(
-            Deno.env.get('MINIPAY_CHECKOUT_AMOUNT_DISPLAY')?.trim() || '0.10',
-          )
-        }
-        if (
-          productToken &&
-          !tokenMatchesConfigured(productToken, configuredToken)
-        ) {
-          return json({
-            success: false,
-            error: 'Product payment currency is not supported for this checkout.',
-          }, 400)
-        }
+      } else if (unitPrice == null) {
+        unitPrice = Number(celoConfig.demoAmountDisplay || '0.10')
       }
 
-      const lineToken = productToken || configuredToken
-
       const unitRaw = parseUnitsDecimal(
-        decimalAmountString(unitPrice, celoConfig.tokenDecimals),
-        celoConfig.tokenDecimals,
+        decimalAmountString(unitPrice, tokenDecimals),
+        tokenDecimals,
       )
       const lineCryptoRaw = unitRaw * BigInt(line.quantity)
       totalCryptoRaw += lineCryptoRaw
+      totalCryptoFace += unitPrice * line.quantity
 
       const energyPrice = Number(item.energy_points_price ?? 0)
       const energySnapshot = Number.isFinite(energyPrice)
@@ -279,19 +325,54 @@ serve(async (req) => {
         quantity: line.quantity,
         product_title_snapshot: String(item.title ?? 'Item'),
         energy_price_snapshot: energySnapshot,
-        crypto_unit_display: `${decimalAmountString(unitPrice, celoConfig.tokenDecimals)} ${lineToken}`,
+        crypto_unit_display: `${decimalAmountString(unitPrice, tokenDecimals)} ${tokenSymbol}`,
         crypto_unit_raw: unitRaw.toString(),
-        token_symbol_snapshot: lineToken,
+        token_symbol_snapshot: tokenSymbol,
         stock_quantity: stock,
       })
       totalQuantity += line.quantity
       energyPointsTotal += energySnapshot * line.quantity
     }
 
-    const tokenSymbol = configuredToken
+    const productFlags = mergeProductDiscountFlags(
+      (itemRows ?? []) as Array<Record<string, unknown>>,
+    )
+    const discount = calculateEnergyDiscount({
+      cryptoTotal: totalCryptoFace,
+      requestedEnergy: requestedEnergyDiscount,
+      userEnergyBalance,
+      settings: paymentSettings,
+      productFlags,
+      moveplusAuthenticated: Boolean(moveplusUserId),
+    })
+
+    const cryptoBeforeRaw = totalCryptoRaw
+    let payableCryptoRaw = totalCryptoRaw
+    let appliedEnergy = discount.applied_energy
+    let discountPhp = discount.discount_php
+    let discountCrypto = discount.discount_crypto
+    let remainingCrypto = discount.remaining_crypto
+    let discountReason = discount.reason
+
+    if (appliedEnergy > 0 && discountCrypto > 0) {
+      payableCryptoRaw = parseUnitsDecimal(
+        decimalAmountString(remainingCrypto, tokenDecimals),
+        tokenDecimals,
+      )
+      // Guard: remaining must be > 0 unless full Energy payment explicitly allowed.
+      if (payableCryptoRaw <= 0n && !discount.allow_full_energy) {
+        payableCryptoRaw = totalCryptoRaw
+        appliedEnergy = 0
+        discountPhp = 0
+        discountCrypto = 0
+        remainingCrypto = totalCryptoFace
+        discountReason = 'full_energy_blocked'
+      }
+    }
+
     const marketplaceItemId = resolvedLines[0].marketplace_item_id
     const totalCryptoDisplay =
-      `${formatUnits(totalCryptoRaw, celoConfig.tokenDecimals)} ${tokenSymbol}`
+      `${formatUnits(payableCryptoRaw, tokenDecimals)} ${tokenSymbol}`
     const cartItemsSnapshot = resolvedLines.map((line) => ({
       marketplace_item_id: line.marketplace_item_id,
       quantity: line.quantity,
@@ -302,6 +383,24 @@ serve(async (req) => {
       token_symbol_snapshot: line.token_symbol_snapshot,
     }))
 
+    let energyDiscountSnapshot: Record<string, unknown> = {
+      energy_php_value: paymentSettings.energy_php_value,
+      php_per_cusd: paymentSettings.php_per_cusd,
+      max_energy_discount_percent: paymentSettings.max_energy_discount_percent,
+      effective_max_percent: discount.effective_max_percent,
+      requested_energy: requestedEnergyDiscount,
+      applied_energy: appliedEnergy,
+      max_energy_allowed: discount.max_energy_allowed,
+      user_energy_balance: userEnergyBalance,
+      discount_php: discountPhp,
+      discount_crypto: discountCrypto,
+      crypto_before: discount.crypto_before,
+      crypto_remaining: remainingCrypto,
+      allow_full_energy: discount.allow_full_energy,
+      moveplus_authenticated: Boolean(moveplusUserId),
+      reason: discountReason,
+    }
+
     const itemTitle = resolvedLines.length === 1
       ? resolvedLines[0].product_title_snapshot
       : `${resolvedLines.length} items (${totalQuantity} qty)`
@@ -310,20 +409,35 @@ serve(async (req) => {
     const tokenHash = await sha256Hex(rawToken)
     const expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString()
 
+    if (appliedEnergy > 0 && !moveplusUserId) {
+      return json({
+        success: false,
+        error: 'Link your Move+ account to apply an Energy discount.',
+      }, 401)
+    }
+
+    const sessionUserId = moveplusUserId ?? userId
+
     const { data: sessionRow, error: insErr } = await admin
       .from('marketplace_minipay_sessions')
       .insert({
-        user_id: userId,
+        user_id: sessionUserId,
         marketplace_item_id: marketplaceItemId,
         session_token_hash: tokenHash,
         chain: 'celo',
         chain_id: celoConfig.chainId,
         provider: 'minipay',
         token_symbol: tokenSymbol,
-        token_address: celoConfig.tokenAddress,
-        token_decimals: celoConfig.tokenDecimals,
-        crypto_amount_raw: totalCryptoRaw.toString(),
+        token_address: tokenAddress,
+        token_decimals: tokenDecimals,
+        crypto_amount_raw: payableCryptoRaw.toString(),
         crypto_amount_display: totalCryptoDisplay,
+        crypto_amount_before_discount_raw: cryptoBeforeRaw.toString(),
+        energy_discount_energy: appliedEnergy,
+        energy_discount_php: discountPhp,
+        energy_discount_crypto: discountCrypto,
+        energy_discount_snapshot: energyDiscountSnapshot,
+        energy_discount_status: 'none',
         treasury_address: celoConfig.treasuryAddress,
         status: 'pending',
         customer_name: customerName,
@@ -344,6 +458,53 @@ serve(async (req) => {
       return json({ success: false, error: 'Failed to create checkout session' }, 500)
     }
 
+    let energyDiscountStatus: string = 'none'
+    let energyReservationId: string | null = null
+
+    if (appliedEnergy > 0 && moveplusUserId) {
+      const { data: reserveRaw, error: reserveErr } = await admin.rpc(
+        'reserve_minipay_energy_discount',
+        {
+          p_session_id: sessionRow.id,
+          p_user_id: moveplusUserId,
+          p_energy_amount: appliedEnergy,
+          p_expires_at: expiresAt,
+        },
+      )
+
+      const reserve = parseEnergyReservationRpc(reserveRaw)
+      if (reserveErr || !reserve.ok) {
+        const code = reserve.error_code ?? reserveErr?.message ?? 'reserve_failed'
+        safeError('minipay_energy_reserve_failed', {
+          session_prefix: String(sessionRow.id).slice(0, 8),
+          code,
+        })
+        await admin.from('marketplace_minipay_sessions').delete().eq('id', sessionRow.id)
+
+        if (code === 'insufficient_balance') {
+          return json({
+            success: false,
+            error: ENERGY_BALANCE_CHANGED_ERROR,
+            error_code: 'insufficient_balance',
+          }, 409)
+        }
+
+        return json({
+          success: false,
+          error: ENERGY_BALANCE_CHANGED_ERROR,
+          error_code: code,
+        }, 409)
+      }
+
+      energyDiscountStatus = 'reserved'
+      energyReservationId = reserve.reservation_id ?? null
+      energyDiscountSnapshot = {
+        ...energyDiscountSnapshot,
+        reservation_id: energyReservationId,
+        energy_discount_status: 'reserved',
+      }
+    }
+
     const checkoutUrl = buildCheckoutUrl(
       celoConfig.checkoutBaseUrl,
       sessionRow.id,
@@ -352,11 +513,14 @@ serve(async (req) => {
 
     safeLog('minipay_checkout_session_created', {
       session_id: sessionRow.id,
-      user_id: userId,
+      user_id: sessionUserId,
       marketplace_item_id: marketplaceItemId,
       line_count: resolvedLines.length,
       total_quantity: totalQuantity,
       chain_id: celoConfig.chainId,
+      token_symbol: tokenSymbol,
+      energy_discount_energy: appliedEnergy,
+      energy_discount_status: energyDiscountStatus,
     })
 
     return json({
@@ -368,17 +532,28 @@ serve(async (req) => {
       chain_id: celoConfig.chainId,
       chain_name: 'Celo',
       token_symbol: tokenSymbol,
-      token_address: celoConfig.tokenAddress,
-      token_decimals: celoConfig.tokenDecimals,
+      token_address: tokenAddress,
+      token_decimals: tokenDecimals,
       amount_display: totalCryptoDisplay,
-      amount_raw: totalCryptoRaw.toString(),
+      amount_raw: payableCryptoRaw.toString(),
+      amount_before_discount_raw: cryptoBeforeRaw.toString(),
       treasury_address: celoConfig.treasuryAddress,
       item_title: itemTitle,
       item_count: resolvedLines.length,
       total_quantity: totalQuantity,
       energy_points_total: energyPointsTotal,
+      energy_discount: energyDiscountSnapshot,
+      energy_discount_status: energyDiscountStatus,
+      energy_discount_reservation_id: energyReservationId,
       cart_items: cartItemsSnapshot,
       delivery_region: 'Philippines only',
+      supported_tokens: ['USDT', 'USDC', 'cUSD'],
+      payment_settings: {
+        energy_php_value: paymentSettings.energy_php_value,
+        php_per_cusd: paymentSettings.php_per_cusd,
+        max_energy_discount_percent: paymentSettings.max_energy_discount_percent,
+        allow_full_energy_payment: paymentSettings.allow_full_energy_payment,
+      },
     }, 200)
   } catch (e) {
     safeError('minipay_create_unhandled', { message: String(e) })
