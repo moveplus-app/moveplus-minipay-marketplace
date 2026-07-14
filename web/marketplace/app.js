@@ -13,8 +13,9 @@ const CATEGORIES = [
   'Vouchers',
 ]
 
-const GEAR_CATEGORY_ORDER = ['All', 'Ronin', 'Genesis', 'Cycling']
+const GEAR_CATEGORY_ORDER = ['All', 'Base', 'Ronin', 'Founder', 'Genesis', 'Cycling']
 const GEAR_PLACEHOLDER_PATH = './assets/gear/gear_placeholder.png'
+const GEAR_BANNER_PATH = './assets/banners/moveplus.png'
 
 const ERC20_TRANSFER_SELECTOR = '0xa9059cbb'
 const ERC20_BALANCE_OF_SELECTOR = '0x70a08231'
@@ -1132,6 +1133,10 @@ function loadGearPreview() {
         cidImageUrl: row.cidImageUrl ?? null,
         imageCandidates: Array.isArray(row.imageCandidates) ? row.imageCandidates : null,
         isGenesis: row.isGenesis === true || String(row.gearType || '').toLowerCase() === 'genesis',
+        isBaseFounder:
+          row.isBaseFounder === true ||
+          String(row.gearType || '').toLowerCase() === 'founder' ||
+          String(row.collection || '').toLowerCase() === 'base founder gear',
       }))
     : []
 }
@@ -1163,10 +1168,12 @@ function gearImageBlock(gear, { detail = false } = {}) {
   const primary = gear.imageUrl || GEAR_PLACEHOLDER_PATH
   const fallback = gear.fallbackImageUrl || GEAR_PLACEHOLDER_PATH
   const imgClass = detail ? 'gear-image detail-hero-img' : 'product-image gear-image'
-  const tokenAttr =
-    gear.isGenesis && gear.tokenId != null
-      ? ` data-genesis-token="${escapeHtml(String(gear.tokenId))}"`
-      : ''
+  let tokenAttr = ''
+  if (gear.isGenesis && gear.tokenId != null) {
+    tokenAttr = ` data-genesis-token="${escapeHtml(String(gear.tokenId))}"`
+  } else if (gear.isBaseFounder && gear.tokenId != null) {
+    tokenAttr = ` data-base-founder-token="${escapeHtml(String(gear.tokenId))}"`
+  }
   return `
     <img
       class="${imgClass}"
@@ -1194,6 +1201,16 @@ function bindGearImageFallbacks(root) {
       typeof window.MovePlusGenesisGear.wireImageFallback === 'function'
     ) {
       window.MovePlusGenesisGear.wireImageFallback(img, genesisToken)
+      return
+    }
+
+    const baseFounderToken = img.getAttribute('data-base-founder-token')
+    if (
+      baseFounderToken &&
+      window.MovePlusBaseFounderGear &&
+      typeof window.MovePlusBaseFounderGear.wireBaseImageFallback === 'function'
+    ) {
+      window.MovePlusBaseFounderGear.wireBaseImageFallback(img, baseFounderToken)
       return
     }
 
@@ -1681,7 +1698,7 @@ function filteredGearItems() {
   const q = state.ui.searchQuery.trim().toLowerCase()
   if (q) {
     items = items.filter((gear) => {
-      const hay = `${gear.title} ${gear.description} ${gear.chain} ${gear.gearType} ${gear.rarity} ${gear.category} ${gear.filterCategory || ''}`.toLowerCase()
+      const hay = `${gear.title} ${gear.description} ${gear.chain} ${gear.gearType} ${gear.rarity} ${gear.badge || ''} ${gear.category} ${gear.filterCategory || ''} ${gear.collection || ''} ${gear.designLabel || ''}`.toLowerCase()
       return hay.includes(q)
     })
   }
@@ -1781,6 +1798,7 @@ function gearCardHtml(gear) {
   const rarityClass = String(gear.rarityKey || gear.rarity || '')
     .toLowerCase()
     .replace(/\s+/g, '-')
+  const badgeLabel = gear.badge || gear.rarity || ''
   return `
     <button type="button" class="product-card gear-card" data-gear-id="${escapeHtml(gear.id)}">
       <div class="product-image-wrap">
@@ -1790,10 +1808,21 @@ function gearCardHtml(gear) {
       <div class="product-body">
         <div class="gear-badge-row">
           ${gear.chain ? `<span class="gear-badge chain">${escapeHtml(gear.chain)}</span>` : ''}
-          ${gear.gearType ? `<span class="gear-badge">${escapeHtml(gear.gearType)}</span>` : ''}
           ${
-            gear.rarity
+            gear.isBaseFounder
+              ? `<span class="gear-badge rarity-founder">${escapeHtml(badgeLabel || 'FOUNDER')}</span>`
+              : gear.gearType
+                ? `<span class="gear-badge">${escapeHtml(gear.gearType)}</span>`
+                : ''
+          }
+          ${
+            !gear.isBaseFounder && gear.rarity
               ? `<span class="gear-badge rarity-${escapeHtml(rarityClass)}">${escapeHtml(gear.rarity)}</span>`
+              : ''
+          }
+          ${
+            gear.multiplier
+              ? `<span class="gear-badge rarity-multiplier">${escapeHtml(gear.multiplier)}</span>`
               : ''
           }
         </div>
@@ -1827,16 +1856,18 @@ function renderCatalog(main) {
       state.selectedCategory === 'Cycling'
         ? 'Cycling gear is coming soon.'
         : 'No digital gear in this category.'
-    const genesisCount = state.gearItems.filter((g) => g.isGenesis).length
 
     main.innerHTML = `
       ${toggle}
-      <section class="card gear-collection-intro">
-        <h2 class="detail-title" style="font-size:16px;margin:0 0 6px">Official Move+ Genesis Collection</h2>
-        <p class="detail-desc" style="margin:0">
-          Genesis Digital Gear #1–#${escapeHtml(String(genesisCount || 100))}. Preview only. Purchase and management are available inside Move+.
-        </p>
-      </section>
+      <div class="gear-banner" aria-hidden="false">
+        <img
+          class="gear-banner-img"
+          src="${escapeHtml(GEAR_BANNER_PATH)}"
+          alt="Move+ Walk Run Cycle banner"
+          loading="eager"
+          decoding="async"
+        />
+      </div>
       <div class="chips" role="tablist">${chips}</div>
       ${
         items.length === 0
@@ -1923,16 +1954,55 @@ function renderGearDetail(main) {
   }
 
   const appUrl = cfg().moveplusAppDeepLink || cfg().moveplusHomeUrl || 'https://amayatoken.online/moveplus/'
-  const explorerUrl =
-    gear.explorerUrl ||
-    (gear.isGenesis &&
-      window.MovePlusGenesisGear &&
-      typeof window.MovePlusGenesisGear.roninExplorerUrl === 'function'
-      ? window.MovePlusGenesisGear.roninExplorerUrl(gear.tokenId)
-      : null)
+  const isFounder = gear.isBaseFounder === true
+
+  let openSeaUrl = null
+  if (
+    isFounder &&
+    window.MovePlusBaseFounderGear &&
+    typeof window.MovePlusBaseFounderGear.openSeaItemUrl === 'function'
+  ) {
+    openSeaUrl = window.MovePlusBaseFounderGear.openSeaItemUrl(gear.tokenId, {
+      chain: gear.chain,
+      collection: gear.collection,
+    })
+  } else if (
+    isFounder &&
+    gear.openSeaUrl &&
+    window.MovePlusBaseFounderGear?.isSafeOpenSeaHttpsUrl?.(gear.openSeaUrl)
+  ) {
+    openSeaUrl = gear.openSeaUrl
+  }
+
+  let explorerUrl = null
+  if (!isFounder) {
+    explorerUrl =
+      gear.explorerUrl ||
+      (gear.isGenesis && window.MovePlusGenesisGear?.roninExplorerUrl
+        ? window.MovePlusGenesisGear.roninExplorerUrl(gear.tokenId)
+        : null)
+  }
+
   const rarityClass = String(gear.rarityKey || gear.rarity || '')
     .toLowerCase()
     .replace(/\s+/g, '-')
+  const badgeLabel = gear.badge || gear.rarity || (isFounder ? 'FOUNDER' : '')
+  const previewCopy = isFounder
+    ? 'Preview only. No purchase in MiniPay. Open Move+ to equip and manage Base Founder Gear.'
+    : 'Preview only. No purchase in MiniPay. Open Move+ to buy, equip, and manage Genesis gear.'
+  const description =
+    gear.description ||
+    (isFounder
+      ? 'Base Founder Gear preview. Purchase and management are available inside Move+.'
+      : 'Genesis Digital Gear preview. Purchase and management are available inside Move+.')
+
+  const secondaryActionHtml = isFounder
+    ? openSeaUrl
+      ? `<a class="btn btn-secondary" id="view-on-opensea" href="${escapeHtml(openSeaUrl)}" target="_blank" rel="noopener noreferrer">View on OpenSea</a>`
+      : `<button type="button" class="btn btn-secondary" id="view-gear-back">Back to Gear</button>`
+    : explorerUrl
+      ? `<button type="button" class="btn btn-secondary" id="view-on-ronin">View on Ronin</button>`
+      : `<button type="button" class="btn btn-secondary" id="view-gear-back">Back to Gear</button>`
 
   main.innerHTML = `
     <button type="button" class="btn btn-ghost" id="back-catalog">← Back to catalog</button>
@@ -1943,37 +2013,59 @@ function renderGearDetail(main) {
     <section class="card">
       <div class="gear-badge-row" style="margin-bottom:10px">
         ${gear.chain ? `<span class="gear-badge chain">${escapeHtml(gear.chain)}</span>` : ''}
-        ${gear.gearType ? `<span class="gear-badge">${escapeHtml(gear.gearType)}</span>` : ''}
         ${
-          gear.rarity
+          isFounder
+            ? `<span class="gear-badge rarity-founder">${escapeHtml(badgeLabel)}</span>`
+            : gear.gearType
+              ? `<span class="gear-badge">${escapeHtml(gear.gearType)}</span>`
+              : ''
+        }
+        ${
+          !isFounder && gear.rarity
             ? `<span class="gear-badge rarity-${escapeHtml(rarityClass)}">${escapeHtml(gear.rarity)}</span>`
+            : ''
+        }
+        ${
+          gear.multiplier
+            ? `<span class="gear-badge rarity-multiplier">${escapeHtml(gear.multiplier)}</span>`
             : ''
         }
       </div>
       <h2 class="detail-title">${escapeHtml(gear.title)}</h2>
-      <p class="detail-desc">${escapeHtml(
-        gear.description ||
-          'Genesis Digital Gear preview. Purchase and management are available inside Move+.',
-      )}</p>
-      <div class="meta-row"><span class="meta-label">Collection</span><span class="meta-value">${escapeHtml(gear.collection || 'Move+ Genesis')}</span></div>
+      <p class="detail-desc">${escapeHtml(description)}</p>
+      <div class="meta-row"><span class="meta-label">Collection</span><span class="meta-value">${escapeHtml(
+        gear.collection || (isFounder ? 'Base Founder Gear' : 'Move+ Genesis'),
+      )}</span></div>
       <div class="meta-row"><span class="meta-label">Token</span><span class="meta-value">${escapeHtml(
         gear.tokenId != null ? `#${gear.tokenId}` : '—',
       )}</span></div>
-      <div class="meta-row"><span class="meta-label">Rarity</span><span class="meta-value">${escapeHtml(gear.rarity || '—')}</span></div>
+      ${
+        isFounder
+          ? `<div class="meta-row"><span class="meta-label">Badge</span><span class="meta-value">Founder</span></div>`
+          : `<div class="meta-row"><span class="meta-label">Rarity</span><span class="meta-value">${escapeHtml(gear.rarity || '—')}</span></div>`
+      }
       <div class="meta-row"><span class="meta-label">Design</span><span class="meta-value">${escapeHtml(gear.designLabel || gear.design || '—')}</span></div>
-      <div class="meta-row"><span class="meta-label">Chain</span><span class="meta-value">${escapeHtml(gear.chain || 'Ronin')}</span></div>
+      <div class="meta-row"><span class="meta-label">Chain</span><span class="meta-value">${escapeHtml(
+        gear.chain || (isFounder ? 'Base' : 'Ronin'),
+      )}</span></div>
+      ${
+        gear.multiplier
+          ? `<div class="meta-row"><span class="meta-label">Multiplier</span><span class="meta-value">${escapeHtml(gear.multiplier)}</span></div>`
+          : ''
+      }
+      ${
+        gear.supplyNote
+          ? `<div class="meta-row"><span class="meta-label">Supply</span><span class="meta-value">${escapeHtml(gear.supplyNote)}</span></div>`
+          : ''
+      }
     </section>
     <section class="card">
-      <div class="alert alert-info">Preview only. No purchase in MiniPay. Open Move+ to buy, equip, and manage Genesis gear.</div>
+      <div class="alert alert-info">${escapeHtml(previewCopy)}</div>
     </section>
     ${diagnosticsHtml()}
     <div class="action-bar" id="gear-detail-actions">
       <button type="button" class="btn btn-primary" id="open-moveplus-app">Open Move+ App</button>
-      ${
-        explorerUrl
-          ? `<button type="button" class="btn btn-secondary" id="view-on-ronin">View on Ronin</button>`
-          : `<button type="button" class="btn btn-secondary" id="view-gear-back">Back to Gear</button>`
-      }
+      ${secondaryActionHtml}
     </div>
   `
 
@@ -1986,6 +2078,7 @@ function renderGearDetail(main) {
   document.getElementById('view-on-ronin')?.addEventListener('click', () => {
     if (explorerUrl) openExternalUrl(explorerUrl)
   })
+  // OpenSea uses an <a target=_blank rel=noopener noreferrer>; no extra click handler needed.
 }
 
 function renderDetail(main) {
@@ -3256,6 +3349,24 @@ function cfgUrl(key, fallback) {
   return typeof v === 'string' && v.trim() ? v.trim().replace(/\/+$/, '') : fallback
 }
 
+/** Public https URL from config (no trailing-slash strip; rejects non-https). */
+function cfgHttpsUrl(key, fallback) {
+  const v = cfg()[key]
+  const raw = typeof v === 'string' && v.trim() ? v.trim() : fallback
+  return sanitizeHttpsUrl(raw)
+}
+
+function sanitizeHttpsUrl(url) {
+  if (typeof url !== 'string') return ''
+  try {
+    const parsed = new URL(url.trim())
+    if (parsed.protocol !== 'https:') return ''
+    return parsed.href
+  } catch (_) {
+    return ''
+  }
+}
+
 function legalPageUrl(page) {
   const key = `${page}Url`
   const defaults = {
@@ -3271,7 +3382,9 @@ function openLegalPage(page) {
 }
 
 function openExternalUrl(url) {
-  window.open(url, '_blank', 'noopener,noreferrer')
+  const safe = sanitizeHttpsUrl(url)
+  if (!safe) return
+  window.open(safe, '_blank', 'noopener,noreferrer')
 }
 
 function setOverlayVisible(visible) {
@@ -4307,6 +4420,7 @@ function openModal({
   primaryAction,
   secondaryLabel,
   secondaryAction,
+  buttons,
 }) {
   const modal = document.getElementById('mp-modal')
   if (!modal) return
@@ -4330,34 +4444,108 @@ function openModal({
 
   const actions = document.createElement('div')
   actions.className = 'modal-actions'
-  if (primaryLabel) {
-    const primaryBtn = document.createElement('button')
-    primaryBtn.type = 'button'
-    primaryBtn.className = 'btn btn-primary'
-    primaryBtn.id = 'mp-modal-primary'
-    primaryBtn.textContent = primaryLabel
-    actions.appendChild(primaryBtn)
-  }
-  if (secondaryLabel) {
-    const secondaryBtn = document.createElement('button')
-    secondaryBtn.type = 'button'
-    secondaryBtn.className = 'btn btn-secondary'
-    secondaryBtn.id = 'mp-modal-secondary'
-    secondaryBtn.textContent = secondaryLabel
-    actions.appendChild(secondaryBtn)
-  }
+  const buttonDefs =
+    Array.isArray(buttons) && buttons.length
+      ? buttons
+      : [
+          primaryLabel
+            ? {
+                id: 'mp-modal-primary',
+                label: primaryLabel,
+                className: 'btn btn-primary',
+                action: primaryAction,
+              }
+            : null,
+          secondaryLabel
+            ? {
+                id: 'mp-modal-secondary',
+                label: secondaryLabel,
+                className: 'btn btn-secondary',
+                action: secondaryAction,
+              }
+            : null,
+        ].filter(Boolean)
+
+  buttonDefs.forEach((def, index) => {
+    const btn = document.createElement('button')
+    btn.type = 'button'
+    btn.className = def.className || (index === 0 ? 'btn btn-primary' : 'btn btn-secondary')
+    if (def.id) btn.id = def.id
+    else btn.id = `mp-modal-btn-${index}`
+    btn.textContent = def.label || ''
+    actions.appendChild(btn)
+  })
   modal.appendChild(actions)
 
   modal.classList.remove('hidden')
   modal.setAttribute('aria-hidden', 'false')
   updateOverlayState()
-  document.getElementById('mp-modal-primary')?.addEventListener('click', () => {
-    primaryAction?.()
-    closeModal()
+  buttonDefs.forEach((def, index) => {
+    const id = def.id || `mp-modal-btn-${index}`
+    document.getElementById(id)?.addEventListener('click', () => {
+      def.action?.()
+      closeModal()
+    })
   })
-  document.getElementById('mp-modal-secondary')?.addEventListener('click', () => {
-    secondaryAction?.()
-    closeModal()
+}
+
+function openDeliveryInfoModal() {
+  const bodyElement = document.createDocumentFragment()
+  const p1 = document.createElement('p')
+  p1.textContent = 'Philippines delivery only for now.'
+  const p2 = document.createElement('p')
+  p2.textContent =
+    'Orders are reviewed before fulfillment. After payment, we’ll confirm the order details and prepare delivery.'
+  bodyElement.appendChild(p1)
+  bodyElement.appendChild(p2)
+  openModal({
+    title: 'Delivery Info',
+    bodyElement,
+    primaryLabel: 'OK',
+    primaryAction: () => {},
+  })
+}
+
+function openEarnRewardsModal() {
+  const androidUrl = cfgHttpsUrl(
+    'androidOpenTestingUrl',
+    'https://play.google.com/apps/testing/com.moveplus.moveplusapp',
+  )
+  const iosUrl = cfgHttpsUrl('iosTestFlightUrl', 'https://testflight.apple.com/join/cbWsbNgt')
+  const bodyElement = document.createDocumentFragment()
+  const p1 = document.createElement('p')
+  p1.textContent = 'Move+ lets you walk, run, or cycle to earn Energy.'
+  const p2 = document.createElement('p')
+  p2.textContent = 'Energy can be used as a marketplace discount.'
+  bodyElement.appendChild(p1)
+  bodyElement.appendChild(p2)
+  openModal({
+    title: 'Earn Rewards',
+    bodyElement,
+    buttons: [
+      {
+        id: 'mp-modal-earn-android',
+        label: 'Android Open Testing',
+        className: 'btn btn-primary',
+        action: () => {
+          if (androidUrl) openExternalUrl(androidUrl)
+        },
+      },
+      {
+        id: 'mp-modal-earn-ios',
+        label: 'iOS TestFlight',
+        className: 'btn btn-secondary',
+        action: () => {
+          if (iosUrl) openExternalUrl(iosUrl)
+        },
+      },
+      {
+        id: 'mp-modal-earn-close',
+        label: 'Close',
+        className: 'btn btn-secondary',
+        action: () => {},
+      },
+    ],
   })
 }
 
@@ -4373,9 +4561,8 @@ function closeModal() {
 function openMenuDrawer() {
   const drawer = document.getElementById('menu-drawer')
   if (!drawer) return
-  const homeUrl = cfgUrl('moveplusHomeUrl', 'https://amayatoken.online/moveplus')
   const supportUrl = cfgUrl('supportUrl', 'https://amayatoken.online/moveplus/support')
-  const appUrl = cfgUrl('moveplusAppDeepLink', homeUrl)
+  const appUrl = cfgUrl('moveplusAppDeepLink', cfgUrl('moveplusHomeUrl', 'https://amayatoken.online/moveplus'))
 
   drawer.innerHTML = `
     <div class="menu-drawer-header">
@@ -4450,7 +4637,7 @@ function openMenuDrawer() {
         return
       }
       if (action === 'earn') {
-        openExternalUrl(homeUrl)
+        openEarnRewardsModal()
         return
       }
       if (action === 'orders') {
@@ -4474,12 +4661,7 @@ function openMenuDrawer() {
         return
       }
       if (action === 'delivery') {
-        openModal({
-          title: 'Delivery Info',
-          body: 'Philippines delivery only. Orders are reviewed before fulfillment.',
-          primaryLabel: 'OK',
-          primaryAction: () => {},
-        })
+        openDeliveryInfoModal()
         return
       }
       if (action === 'open-app') {
