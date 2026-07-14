@@ -13,7 +13,7 @@ const CATEGORIES = [
   'Vouchers',
 ]
 
-const GEAR_CATEGORY_ORDER = ['All', 'Ronin', 'Base', 'Genesis', 'Shoebox', 'Founder', 'Cycling']
+const GEAR_CATEGORY_ORDER = ['All', 'Ronin', 'Genesis', 'Cycling']
 const GEAR_PLACEHOLDER_PATH = './assets/gear/gear_placeholder.png'
 
 const ERC20_TRANSFER_SELECTOR = '0xa9059cbb'
@@ -38,7 +38,7 @@ const SUPPORTED_MINIPAY_TOKENS = {
     decimals: 18,
   },
 }
-const MINIPAY_TOKEN_PRIORITY = ['USDT', 'USDC', 'cUSD']
+const MINIPAY_TOKEN_PRIORITY = ['cUSD', 'USDT', 'USDC']
 
 const state = {
   view: 'catalog',
@@ -51,7 +51,24 @@ const state = {
   checkoutSession: null,
   autoPayAfterSession: false,
   paymentInFlight: false,
-  selectedPaymentToken: 'USDT',
+  selectedPaymentToken: 'cUSD',
+  requestedEnergyDiscount: 0,
+  /** Server Energy discount hold status for active checkout session: none|reserved|redeemed|released|failed_review */
+  energyDiscountStatus: 'none',
+  /** In-memory delivery draft only — never localStorage (PII). */
+  checkoutDraft: null,
+  checkoutEditingDetails: true,
+  /** Linked Move+ marketplace session + Energy balance (in-memory; token also in localStorage). */
+  movePlusSession: {
+    linked: false,
+    token: null,
+    energyBalance: null,
+    balanceStatus: 'idle',
+    balanceError: null,
+    updatedAt: null,
+    sessionExpiresAt: null,
+  },
+  paymentSettings: null,
   loading: true,
   error: null,
   catalogMeta: null,
@@ -169,7 +186,98 @@ function resolvePaymentToken(symbolInput) {
 }
 
 function getSelectedPaymentToken() {
-  return resolvePaymentToken(state.selectedPaymentToken) || SUPPORTED_MINIPAY_TOKENS.USDT
+  return resolvePaymentToken(state.selectedPaymentToken) || SUPPORTED_MINIPAY_TOKENS.cUSD
+}
+
+function emptyCheckoutDraft() {
+  return {
+    customer_name: '',
+    phone_number: '',
+    email: '',
+    delivery_address: '',
+    comments: '',
+  }
+}
+
+function isCheckoutDraftEmpty(draft) {
+  if (!draft) return true
+  return !(
+    draft.customer_name ||
+    draft.phone_number ||
+    draft.email ||
+    draft.delivery_address ||
+    draft.comments
+  )
+}
+
+function readCheckoutDraftFromForm(form) {
+  const read = (name) => {
+    const el =
+      (form.elements && form.elements.namedItem && form.elements.namedItem(name)) ||
+      form.querySelector(`[name="${name}"]`)
+    return String(el?.value ?? '').trim()
+  }
+  return {
+    customer_name: read('customer_name'),
+    phone_number: read('phone_number'),
+    email: read('email'),
+    delivery_address: read('delivery_address'),
+    comments: read('comments'),
+  }
+}
+
+/**
+ * Capture delivery fields into in-memory state only (never localStorage / URL).
+ * Guards against async re-render races that would overwrite a filled draft with empties.
+ */
+function saveCheckoutDraftFromDom() {
+  const form = document.getElementById('checkout-form')
+  if (!form) return state.checkoutDraft
+  // Summary mode: keep memory draft; no editable form fields.
+  if (!state.checkoutEditingDetails && state.checkoutDraft) {
+    return state.checkoutDraft
+  }
+  const draft = readCheckoutDraftFromForm(form)
+  // Race guard: do not clobber a previously filled draft with a blank form snapshot.
+  if (isCheckoutDraftEmpty(draft) && !isCheckoutDraftEmpty(state.checkoutDraft)) {
+    return state.checkoutDraft
+  }
+  state.checkoutDraft = draft
+  return draft
+}
+
+function checkoutDraftIsComplete(draft) {
+  if (!draft) return false
+  return Boolean(
+    draft.customer_name &&
+      draft.phone_number &&
+      draft.email &&
+      draft.email.includes('@') &&
+      draft.delivery_address,
+  )
+}
+
+function getCheckoutDraft() {
+  return state.checkoutDraft || emptyCheckoutDraft()
+}
+
+/** Save form values and collapse to summary when required delivery fields exist. */
+function captureCheckoutDeliveryState({ collapseIfComplete = false } = {}) {
+  saveCheckoutDraftFromDom()
+  if (collapseIfComplete && checkoutDraftIsComplete(state.checkoutDraft)) {
+    state.checkoutEditingDetails = false
+  }
+  return state.checkoutDraft
+}
+
+function bindCheckoutDraftAutosave(form) {
+  if (!form || form.dataset.draftAutosave === '1') return
+  form.dataset.draftAutosave = '1'
+  const sync = () => {
+    saveCheckoutDraftFromDom()
+  }
+  form.addEventListener('input', sync)
+  form.addEventListener('change', sync)
 }
 
 function parseUsdPriceToRaw(amount, decimals) {
@@ -397,6 +505,12 @@ function normalizeMarketplaceProduct(row) {
     energyPrice: Number(row.energy_points_price ?? 0),
     cryptoPrice,
     cryptoSymbol,
+    allowEnergyDiscount: row.allow_energy_discount !== false,
+    maxEnergyDiscountPercent:
+      row.max_energy_discount_percent != null && row.max_energy_discount_percent !== ''
+        ? Number(row.max_energy_discount_percent)
+        : null,
+    allowFullEnergyPayment: row.allow_full_energy_payment === true,
     stock,
     isAvailable,
     isSoldOut,
@@ -527,8 +641,27 @@ function formatProductCryptoLabel(product) {
   if (!product || product.cryptoPrice == null) return null
   const amount = Number(product.cryptoPrice)
   if (!Number.isFinite(amount) || amount <= 0) return null
-  // crypto_price is USD stablecoin price (USDT/USDC/cUSD share the same number).
+  // crypto_price is stable USD price (cUSD/USDT/USDC share the same number).
   return `${formatMoneyAmount(amount)} USD`
+}
+
+/** Prefixed display: `$5.00 USD` (catalog/detail). */
+function formatProductUsdPriceLabel(product) {
+  if (!product || product.cryptoPrice == null) return null
+  const amount = Number(product.cryptoPrice)
+  if (!Number.isFinite(amount) || amount <= 0) return null
+  return `$${formatMoneyAmount(amount)} USD`
+}
+
+function productEnergyDiscountLabel(product) {
+  if (!product) return 'No discount'
+  if (product.allowEnergyDiscount === false) return 'No discount'
+  const max =
+    product.maxEnergyDiscountPercent != null && Number.isFinite(Number(product.maxEnergyDiscountPercent))
+      ? Number(product.maxEnergyDiscountPercent)
+      : 20
+  const maxLabel = Number.isInteger(max) ? String(max) : String(max)
+  return `Discount enabled · max ${maxLabel}%`
 }
 
 function formatMoneyAmount(amount) {
@@ -764,6 +897,11 @@ function getCartTotals() {
     0,
   )
   const crypto = sumCartCryptoTotals(lines)
+  const usdTotal = lines.reduce((sum, line) => {
+    const unit = Number(line.product.cryptoPrice)
+    if (!Number.isFinite(unit) || unit <= 0) return sum
+    return sum + unit * line.quantity
+  }, 0)
   return {
     lines,
     totalQuantity,
@@ -771,7 +909,139 @@ function getCartTotals() {
     cryptoSubtotal: crypto.display,
     tokenSymbol: crypto.tokenSymbol,
     hasCryptoPrices: crypto.hasPrice,
+    usdTotal,
   }
+}
+
+function getPaymentSettings() {
+  const fromState = state.paymentSettings
+  const cfgSettings = cfg().paymentSettings || {}
+  return {
+    energyPhpValue: Number(fromState?.energy_php_value ?? cfgSettings.energyPhpValue ?? 0.1),
+    phpPerCusd: Number(fromState?.php_per_cusd ?? cfgSettings.phpPerCusd ?? 56),
+    maxEnergyDiscountPercent: Number(
+      fromState?.max_energy_discount_percent ?? cfgSettings.maxEnergyDiscountPercent ?? 20,
+    ),
+    maxEnergyDiscountAmountPhp:
+      fromState?.max_energy_discount_amount_php != null
+        ? Number(fromState.max_energy_discount_amount_php)
+        : cfgSettings.maxEnergyDiscountAmountPhp != null
+          ? Number(cfgSettings.maxEnergyDiscountAmountPhp)
+          : null,
+    allowFullEnergyPayment:
+      fromState?.allow_full_energy_payment === true ||
+      cfgSettings.allowFullEnergyPayment === true,
+  }
+}
+
+async function loadPaymentSettings() {
+  try {
+    const rows = await supabaseRest(
+      'marketplace_payment_settings?select=energy_php_value,php_per_cusd,max_energy_discount_percent,max_energy_discount_amount_php,allow_full_energy_payment&limit=1',
+    )
+    if (Array.isArray(rows) && rows[0]) {
+      state.paymentSettings = rows[0]
+    }
+  } catch (_) {
+    /* keep defaults */
+  }
+}
+
+function cartAllowsEnergyDiscount() {
+  const lines = getCartLines()
+  if (!lines.length) return false
+  return lines.every((line) => line.product.allowEnergyDiscount !== false)
+}
+
+function effectiveMaxEnergyDiscountPercent() {
+  const settings = getPaymentSettings()
+  let maxPct = settings.maxEnergyDiscountPercent
+  for (const line of getCartLines()) {
+    const p = line.product.maxEnergyDiscountPercent
+    if (p != null && Number.isFinite(p)) maxPct = Math.min(maxPct, p)
+  }
+  const allowFull =
+    settings.allowFullEnergyPayment &&
+    getCartLines().every((line) => line.product.allowFullEnergyPayment === true)
+  if (allowFull) return 100
+  return Math.max(0, Math.min(100, maxPct))
+}
+
+/** Client-side preview only — server recalculates authoritatively. */
+function previewEnergyDiscount(requestedEnergy) {
+  const totals = getCartTotals()
+  const settings = getPaymentSettings()
+  const cryptoBefore = totals.usdTotal
+  const session = state.movePlusSession || {}
+  const linked = Boolean(session.linked) || isMoveplusAccountLinked()
+  const balanceReady = session.balanceStatus === 'ready' && session.energyBalance != null
+  const balance = balanceReady ? Math.max(0, Math.floor(Number(session.energyBalance))) : null
+  const balanceStatus = session.balanceStatus || (linked ? 'loading' : 'idle')
+
+  if (!cartAllowsEnergyDiscount() || cryptoBefore <= 0) {
+    return {
+      appliedEnergy: 0,
+      discountPhp: 0,
+      discountCrypto: 0,
+      remainingCrypto: cryptoBefore,
+      maxEnergy: 0,
+      maxByCap: 0,
+      linked,
+      balance,
+      balanceStatus,
+      balanceKnown: balanceReady,
+      canApply: false,
+    }
+  }
+
+  const maxPct = effectiveMaxEnergyDiscountPercent()
+  const phpTotal = cryptoBefore * settings.phpPerCusd
+  let maxDiscountPhp = (phpTotal * maxPct) / 100
+  if (settings.maxEnergyDiscountAmountPhp != null) {
+    maxDiscountPhp = Math.min(maxDiscountPhp, settings.maxEnergyDiscountAmountPhp)
+  }
+  const maxByCap = Math.floor(maxDiscountPhp / settings.energyPhpValue)
+  // Only compute max usable from balance when sync is ready.
+  const maxEnergy = balanceReady
+    ? Math.max(0, Math.min(maxByCap, balance))
+    : 0
+  const requested = Math.max(0, Math.floor(Number(requestedEnergy) || 0))
+  const canApply = linked && balanceReady
+  const applied = canApply ? Math.min(requested, maxEnergy) : 0
+  const discountPhp = applied * settings.energyPhpValue
+  const discountCrypto = Math.min(discountPhp / settings.phpPerCusd, cryptoBefore)
+  return {
+    appliedEnergy: applied,
+    discountPhp,
+    discountCrypto,
+    remainingCrypto: Math.max(0, cryptoBefore - discountCrypto),
+    maxEnergy,
+    maxByCap,
+    linked,
+    balance,
+    balanceStatus,
+    balanceKnown: balanceReady,
+    canApply,
+    maxPct,
+    energyPhpValue: settings.energyPhpValue,
+    phpPerCusd: settings.phpPerCusd,
+  }
+}
+
+function formatCusdAmount(n) {
+  if (!Number.isFinite(n)) return '—'
+  return n.toLocaleString(undefined, {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 4,
+  })
+}
+
+function formatPhpAmount(n) {
+  if (!Number.isFinite(n)) return '—'
+  return `₱${n.toLocaleString(undefined, {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })}`
 }
 
 function buildCheckoutItemsPayload() {
@@ -849,6 +1119,9 @@ function isDigitalGear(item) {
 }
 
 function loadGearPreview() {
+  if (window.MOVEPLUS_DIGITAL_GEAR && typeof window.MOVEPLUS_DIGITAL_GEAR.rebuild === 'function') {
+    window.MOVEPLUS_DIGITAL_GEAR.rebuild()
+  }
   const rows = window.MOVEPLUS_DIGITAL_GEAR_PREVIEW
   state.gearItems = Array.isArray(rows)
     ? rows.map((row) => ({
@@ -857,6 +1130,8 @@ function loadGearPreview() {
         imageUrl: row.imageUrl || GEAR_PLACEHOLDER_PATH,
         fallbackImageUrl: row.fallbackImageUrl || row.imageUrl || GEAR_PLACEHOLDER_PATH,
         cidImageUrl: row.cidImageUrl ?? null,
+        imageCandidates: Array.isArray(row.imageCandidates) ? row.imageCandidates : null,
+        isGenesis: row.isGenesis === true || String(row.gearType || '').toLowerCase() === 'genesis',
       }))
     : []
 }
@@ -888,13 +1163,20 @@ function gearImageBlock(gear, { detail = false } = {}) {
   const primary = gear.imageUrl || GEAR_PLACEHOLDER_PATH
   const fallback = gear.fallbackImageUrl || GEAR_PLACEHOLDER_PATH
   const imgClass = detail ? 'gear-image detail-hero-img' : 'product-image gear-image'
+  const tokenAttr =
+    gear.isGenesis && gear.tokenId != null
+      ? ` data-genesis-token="${escapeHtml(String(gear.tokenId))}"`
+      : ''
   return `
     <img
       class="${imgClass}"
       src="${escapeHtml(primary)}"
       data-fallback="${escapeHtml(fallback)}"
+      ${tokenAttr}
       alt=""
       loading="lazy"
+      decoding="async"
+      referrerpolicy="no-referrer"
     />
     <div class="gear-image-fallback hidden" aria-hidden="true">Preview</div>
   `
@@ -904,6 +1186,17 @@ function bindGearImageFallbacks(root) {
   root.querySelectorAll('img.gear-image').forEach((img) => {
     if (img.dataset.gearBound) return
     img.dataset.gearBound = '1'
+
+    const genesisToken = img.getAttribute('data-genesis-token')
+    if (
+      genesisToken &&
+      window.MovePlusGenesisGear &&
+      typeof window.MovePlusGenesisGear.wireImageFallback === 'function'
+    ) {
+      window.MovePlusGenesisGear.wireImageFallback(img, genesisToken)
+      return
+    }
+
     img.addEventListener('error', () => {
       const fallback = img.getAttribute('data-fallback') || GEAR_PLACEHOLDER_PATH
       if (!img.dataset.triedFallback && fallback) {
@@ -982,15 +1275,62 @@ function friendlyFetchError(err) {
 }
 
 function friendlyApiError(status, data) {
-  if (data?.error && typeof data.error === 'string') return data.error
+  if (data?.error && typeof data.error === 'string') {
+    if (
+      data.error_code === 'insufficient_balance' ||
+      /energy balance changed/i.test(data.error)
+    ) {
+      state.requestedEnergyDiscount = 0
+      void fetchMovePlusEnergyBalance({ force: true, silent: true })
+    }
+    return data.error
+  }
   if (status === 403) return 'Checkout link is invalid. Please start checkout again.'
   if (status === 404) return 'Product or checkout session not found.'
   if (status === 410 || data?.status === 'expired') {
-    return 'Checkout session expired. Please start checkout again.'
+    state.requestedEnergyDiscount = 0
+    state.energyDiscountStatus = data?.energy_discount_status === 'released'
+      ? 'released'
+      : 'none'
+    void fetchMovePlusEnergyBalance({ force: true, silent: true })
+    return 'Checkout session expired. Energy discount was released — apply again at checkout.'
   }
   if (status === 429) return 'Too many requests. Please wait and try again.'
   if (status === 503) return 'Checkout is temporarily unavailable.'
   return 'Could not complete checkout. Please try again.'
+}
+
+function energyDiscountStatusLabel(status) {
+  switch (String(status || 'none')) {
+    case 'reserved':
+      return 'Reserved'
+    case 'redeemed':
+      return 'Applied'
+    case 'released':
+      return 'Released — apply again'
+    case 'failed_review':
+      return 'Needs admin review'
+    default:
+      return 'None'
+  }
+}
+
+function applyPaidSessionEnergyFields(session, data) {
+  const energyStatus = data?.energy_discount_status || session.energyDiscountStatus || 'none'
+  state.energyDiscountStatus = energyStatus
+  if (energyStatus === 'redeemed' || energyStatus === 'released' || energyStatus === 'failed_review') {
+    state.requestedEnergyDiscount = 0
+  }
+  return {
+    ...session,
+    energyDiscountStatus: energyStatus,
+    energyDiscountEnergy: Number.isFinite(Number(data?.energy_discount_energy))
+      ? Math.max(0, Math.floor(Number(data.energy_discount_energy)))
+      : session.energyDiscountEnergy ?? 0,
+    fulfillmentReviewRequired: data?.fulfillment_review_required === true,
+    warning: data?.warning || null,
+    orderStatus: data?.order_status || null,
+  }
 }
 
 const VERIFY_PENDING_MESSAGE =
@@ -1103,22 +1443,31 @@ async function retryVerifyPayment(txHash, payer) {
 
     setPaymentDebug({ step: 'payment-successful', lastError: null })
     state.paymentInFlight = false
+    void fetchMovePlusEnergyBalance({ force: true, silent: true })
     setView('paid', {
-      session: {
-        ...session,
-        txHash: data.tx_hash || String(txHash),
-        explorerUrl: data.explorer_url,
-        receiptTxHash: data.receipt_tx_hash ?? null,
-        receiptExplorerUrl: data.receipt_explorer_url ?? null,
-        receiptPending: data.receipt_pending === true,
-        receiptRecorded: data.receipt_recorded === true || Boolean(data.receipt_tx_hash),
-        verifyPending: false,
-      },
+      session: applyPaidSessionEnergyFields(
+        {
+          ...session,
+          txHash: data.tx_hash || String(txHash),
+          explorerUrl: data.explorer_url,
+          receiptTxHash: data.receipt_tx_hash ?? null,
+          receiptExplorerUrl: data.receipt_explorer_url ?? null,
+          receiptPending: data.receipt_pending === true,
+          receiptRecorded: data.receipt_recorded === true || Boolean(data.receipt_tx_hash),
+          verifyPending: false,
+        },
+        data,
+      ),
     })
     clearCart()
   } catch (err) {
     logDebug('verify retry error', err)
     if (isDebugMode()) setPaymentDebug({ lastError: String(err?.message ?? err) })
+    if (String(err?.message ?? '').includes('expired')) {
+      state.requestedEnergyDiscount = 0
+      state.energyDiscountStatus = 'released'
+      void fetchMovePlusEnergyBalance({ force: true, silent: true })
+    }
     if (isVerifyPendingError(err)) {
       showVerifyPendingRecovery(session, txHash, payerAddr)
       return
@@ -1227,7 +1576,7 @@ async function loadCatalog() {
   try {
     // Same filters as native SupabaseService.getMarketplaceItems()
     const select =
-      'id,title,description,image_url,energy_points_price,crypto_price,crypto_currency,category,stock_quantity,is_available,is_deleted,is_limited_offer,offer_ends_at,offer_label,created_at,updated_at'
+      'id,title,description,image_url,energy_points_price,crypto_price,crypto_currency,category,stock_quantity,is_available,is_deleted,is_limited_offer,offer_ends_at,offer_label,allow_energy_discount,max_energy_discount_percent,allow_full_energy_payment,created_at,updated_at'
     const query = `${table}?select=${select}&is_available=eq.true&is_deleted=eq.false&order=created_at.desc`
     let rows = await supabaseRest(query)
     if (!Array.isArray(rows)) rows = []
@@ -1403,7 +1752,8 @@ function productCardHtml(product) {
   const imageBlock = img
     ? `<img class="product-image" src="${escapeHtml(img)}" alt="" loading="lazy" />`
     : `<div class="product-image placeholder">No image</div>`
-  const cryptoLabel = formatProductCryptoLabel(product) || '—'
+  const cryptoLabel = formatProductUsdPriceLabel(product) || formatProductCryptoLabel(product) || '—'
+  const energyDiscountNote = productEnergyDiscountLabel(product)
 
   const offerBadge =
     product.isLimitedOffer && product.offerCountdown
@@ -1420,38 +1770,40 @@ function productCardHtml(product) {
       </div>
       <div class="product-body">
         <h2 class="product-title">${escapeHtml(product.title)}</h2>
-        <div class="price-row">
-          ${formatEnergyPriceHtml(product.energyPrice)}
-        </div>
-        <div class="price-crypto">${escapeHtml(cryptoLabel)}</div>
+        <div class="price-row price-usd">${escapeHtml(cryptoLabel)}</div>
+        <div class="price-crypto">${escapeHtml(energyDiscountNote)}</div>
       </div>
     </button>
   `
 }
 
 function gearCardHtml(gear) {
-  const stats = []
-  if (gear.supplyNote) stats.push(gear.supplyNote)
-  if (gear.dailyCap && gear.dailyCap !== '—') stats.push(`Daily cap: ${gear.dailyCap}`)
-  if (gear.multiplier && gear.multiplier !== '—') stats.push(`${gear.multiplier}`)
-  if (gear.repairDiscount && gear.repairDiscount !== '—' && stats.length < 2) {
-    stats.push(`Repair: ${gear.repairDiscount}`)
-  }
-
+  const rarityClass = String(gear.rarityKey || gear.rarity || '')
+    .toLowerCase()
+    .replace(/\s+/g, '-')
   return `
     <button type="button" class="product-card gear-card" data-gear-id="${escapeHtml(gear.id)}">
       <div class="product-image-wrap">
         ${gearImageBlock(gear)}
+        <span class="badge gear-preview-badge">Preview</span>
       </div>
       <div class="product-body">
         <div class="gear-badge-row">
           ${gear.chain ? `<span class="gear-badge chain">${escapeHtml(gear.chain)}</span>` : ''}
           ${gear.gearType ? `<span class="gear-badge">${escapeHtml(gear.gearType)}</span>` : ''}
-          ${gear.rarity ? `<span class="gear-badge">${escapeHtml(gear.rarity)}</span>` : ''}
+          ${
+            gear.rarity
+              ? `<span class="gear-badge rarity-${escapeHtml(rarityClass)}">${escapeHtml(gear.rarity)}</span>`
+              : ''
+          }
         </div>
         <h2 class="product-title">${escapeHtml(gear.title)}</h2>
-        ${stats.length ? `<div class="gear-stat">${escapeHtml(stats.join(' · '))}</div>` : ''}
-        <div class="gear-stat">View in Move+ app</div>
+        ${
+          gear.designLabel
+            ? `<div class="gear-stat">${escapeHtml(gear.designLabel)}</div>`
+            : ''
+        }
+        <div class="gear-stat">Preview only · Open in Move+</div>
       </div>
     </button>
   `
@@ -1475,12 +1827,15 @@ function renderCatalog(main) {
       state.selectedCategory === 'Cycling'
         ? 'Cycling gear is coming soon.'
         : 'No digital gear in this category.'
+    const genesisCount = state.gearItems.filter((g) => g.isGenesis).length
 
     main.innerHTML = `
       ${toggle}
-      <section class="card">
-        <div class="alert alert-info">Digital gear is preview-only for now. Purchases and management happen inside Move+.</div>
-        <p class="detail-desc" style="margin-top:8px">MiniPay checkout currently applies to Real Items only.</p>
+      <section class="card gear-collection-intro">
+        <h2 class="detail-title" style="font-size:16px;margin:0 0 6px">Official Move+ Genesis Collection</h2>
+        <p class="detail-desc" style="margin:0">
+          Genesis Digital Gear #1–#${escapeHtml(String(genesisCount || 100))}. Preview only. Purchase and management are available inside Move+.
+        </p>
       </section>
       <div class="chips" role="tablist">${chips}</div>
       ${
@@ -1568,40 +1923,57 @@ function renderGearDetail(main) {
   }
 
   const appUrl = cfg().moveplusAppDeepLink || cfg().moveplusHomeUrl || 'https://amayatoken.online/moveplus/'
+  const explorerUrl =
+    gear.explorerUrl ||
+    (gear.isGenesis &&
+      window.MovePlusGenesisGear &&
+      typeof window.MovePlusGenesisGear.roninExplorerUrl === 'function'
+      ? window.MovePlusGenesisGear.roninExplorerUrl(gear.tokenId)
+      : null)
+  const rarityClass = String(gear.rarityKey || gear.rarity || '')
+    .toLowerCase()
+    .replace(/\s+/g, '-')
 
   main.innerHTML = `
     <button type="button" class="btn btn-ghost" id="back-catalog">← Back to catalog</button>
     <div class="detail-hero">
       ${gearImageBlock(gear, { detail: true })}
+      <span class="badge gear-preview-badge gear-preview-badge--detail">Preview only</span>
     </div>
     <section class="card">
       <div class="gear-badge-row" style="margin-bottom:10px">
         ${gear.chain ? `<span class="gear-badge chain">${escapeHtml(gear.chain)}</span>` : ''}
         ${gear.gearType ? `<span class="gear-badge">${escapeHtml(gear.gearType)}</span>` : ''}
-        ${gear.rarity ? `<span class="gear-badge">${escapeHtml(gear.rarity)}</span>` : ''}
+        ${
+          gear.rarity
+            ? `<span class="gear-badge rarity-${escapeHtml(rarityClass)}">${escapeHtml(gear.rarity)}</span>`
+            : ''
+        }
       </div>
       <h2 class="detail-title">${escapeHtml(gear.title)}</h2>
-      <p class="detail-desc">${escapeHtml(gear.description || 'Digital gear preview.')}</p>
-      <div class="meta-row"><span class="meta-label">Chain</span><span class="meta-value">${escapeHtml(gear.chain || '—')}</span></div>
-      <div class="meta-row"><span class="meta-label">Gear type</span><span class="meta-value">${escapeHtml(gear.gearType || '—')}</span></div>
+      <p class="detail-desc">${escapeHtml(
+        gear.description ||
+          'Genesis Digital Gear preview. Purchase and management are available inside Move+.',
+      )}</p>
+      <div class="meta-row"><span class="meta-label">Collection</span><span class="meta-value">${escapeHtml(gear.collection || 'Move+ Genesis')}</span></div>
+      <div class="meta-row"><span class="meta-label">Token</span><span class="meta-value">${escapeHtml(
+        gear.tokenId != null ? `#${gear.tokenId}` : '—',
+      )}</span></div>
       <div class="meta-row"><span class="meta-label">Rarity</span><span class="meta-value">${escapeHtml(gear.rarity || '—')}</span></div>
-      <div class="meta-row"><span class="meta-label">Daily cap</span><span class="meta-value">${escapeHtml(gear.dailyCap || '—')}</span></div>
-      <div class="meta-row"><span class="meta-label">Multiplier</span><span class="meta-value">${escapeHtml(gear.multiplier || '—')}</span></div>
-      <div class="meta-row"><span class="meta-label">Repair</span><span class="meta-value">${escapeHtml(gear.repairDiscount || '—')}</span></div>
-      ${
-        gear.supplyNote
-          ? `<div class="meta-row"><span class="meta-label">Supply</span><span class="meta-value">${escapeHtml(gear.supplyNote)}</span></div>`
-          : ''
-      }
+      <div class="meta-row"><span class="meta-label">Design</span><span class="meta-value">${escapeHtml(gear.designLabel || gear.design || '—')}</span></div>
+      <div class="meta-row"><span class="meta-label">Chain</span><span class="meta-value">${escapeHtml(gear.chain || 'Ronin')}</span></div>
     </section>
     <section class="card">
-      <div class="alert alert-info">Digital gear is preview-only for now. Purchases and management happen inside Move+.</div>
-      <p class="detail-desc" style="margin-top:8px">MiniPay checkout currently applies to Real Items only.</p>
+      <div class="alert alert-info">Preview only. No purchase in MiniPay. Open Move+ to buy, equip, and manage Genesis gear.</div>
     </section>
     ${diagnosticsHtml()}
     <div class="action-bar" id="gear-detail-actions">
       <button type="button" class="btn btn-primary" id="open-moveplus-app">Open Move+ App</button>
-      <button type="button" class="btn btn-secondary" id="view-gear-back">Back to Gear</button>
+      ${
+        explorerUrl
+          ? `<button type="button" class="btn btn-secondary" id="view-on-ronin">View on Ronin</button>`
+          : `<button type="button" class="btn btn-secondary" id="view-gear-back">Back to Gear</button>`
+      }
     </div>
   `
 
@@ -1610,6 +1982,9 @@ function renderGearDetail(main) {
   document.getElementById('view-gear-back')?.addEventListener('click', () => setView('catalog'))
   document.getElementById('open-moveplus-app')?.addEventListener('click', () => {
     openExternalUrl(appUrl)
+  })
+  document.getElementById('view-on-ronin')?.addEventListener('click', () => {
+    if (explorerUrl) openExternalUrl(explorerUrl)
   })
 }
 
@@ -1652,8 +2027,9 @@ function renderDetail(main) {
       <h2 class="detail-title">${escapeHtml(product.title)}</h2>
       <p class="detail-desc">${escapeHtml(product.description || 'No description provided.')}</p>
       <div class="meta-row"><span class="meta-label">Category</span><span class="meta-value">${escapeHtml(product.category || '—')}</span></div>
-      <div class="meta-row"><span class="meta-label">Energy price</span><span class="meta-value">${formatEnergyPriceHtml(product.energyPrice)}</span></div>
-      <div class="meta-row"><span class="meta-label">Crypto price</span><span class="meta-value">${escapeHtml(formatProductCryptoLabel(product) || '—')} · ${escapeHtml(cfg().chainName || 'Celo')}</span></div>
+      <div class="meta-row"><span class="meta-label">Price</span><span class="meta-value">${escapeHtml(formatProductUsdPriceLabel(product) || formatProductCryptoLabel(product) || '—')}</span></div>
+      <div class="meta-row"><span class="meta-label">MiniPay</span><span class="meta-value">cUSD / USDT / USDC</span></div>
+      <div class="meta-row"><span class="meta-label">Energy</span><span class="meta-value">${escapeHtml(productEnergyDiscountLabel(product))}</span></div>
       <div class="meta-row"><span class="meta-label">Delivery</span><span class="meta-value">Philippines only</span></div>
       <div class="meta-row"><span class="meta-label">Stock</span><span class="meta-value">${escapeHtml(stockDisplayLabel(product))}</span></div>
     </section>
@@ -1713,8 +2089,8 @@ function renderCart(main) {
           ${thumb}
           <div class="cart-line-body">
             <h3 class="cart-line-title">${escapeHtml(p.title)}</h3>
-            <div class="cart-line-price">${formatEnergyPriceHtml(p.energyPrice)}</div>
-            <div class="cart-line-crypto">${escapeHtml(formatProductCryptoLabel(p) || '—')} each</div>
+            <div class="cart-line-price">${escapeHtml(formatProductUsdPriceLabel(p) || formatProductCryptoLabel(p) || '—')}</div>
+            <div class="cart-line-crypto">${escapeHtml(productEnergyDiscountLabel(p))}</div>
             ${
               p.isSoldOut || p.offerExpired || isOfferExpiredProduct(p)
                 ? `<div class="cart-line-warn">${p.offerExpired || isOfferExpiredProduct(p) ? 'This offer has expired.' : 'Unavailable — remove to continue'}</div>`
@@ -1738,10 +2114,9 @@ function renderCart(main) {
       <div class="cart-lines">${lineHtml}</div>
     </section>
     <section class="card">
-      <div class="meta-row"><span class="meta-label">Energy subtotal</span><span class="meta-value">${formatEnergyPriceHtml(totals.totalEnergy)}</span></div>
-      <div class="meta-row"><span class="meta-label">Crypto subtotal</span><span class="meta-value">${escapeHtml(totals.cryptoSubtotal)}</span></div>
+      <div class="meta-row"><span class="meta-label">Product total</span><span class="meta-value">${escapeHtml(totals.cryptoSubtotal)}</span></div>
       <div class="meta-row"><span class="meta-label">Delivery</span><span class="meta-value">Philippines only</span></div>
-      <p class="detail-desc" style="margin-top:8px">Display totals are estimates. Payment amount is calculated by the server at checkout.</p>
+      <p class="detail-desc" style="margin-top:8px">Display totals are estimates. Payment amount is calculated by the server at checkout. Energy discount is applied at checkout.</p>
     </section>
     ${cartHasUnavailableItems() ? `<section class="card"><div class="alert alert-warn">Remove expired or unavailable items before checkout.</div></section>` : ''}
     ${diagnosticsHtml()}
@@ -1808,7 +2183,7 @@ function renderCheckoutSummaryHtml(totals) {
       (line) => `
       <div class="checkout-line">
         <span>${escapeHtml(line.product.title)} × ${line.quantity}</span>
-        <span>${formatEnergyPriceHtml(line.product.energyPrice * line.quantity)}</span>
+        <span>${escapeHtml(formatProductUsdPriceLabel(line.product) || formatProductCryptoLabel(line.product) || '—')}</span>
       </div>
     `,
     )
@@ -1834,23 +2209,19 @@ function renderCheckoutForm(main) {
   const minipayBlockedReason = missingPrice
     ? 'Set a USD crypto price in Admin Dashboard before MiniPay checkout.'
     : null
-  const payLabel = `Pay with ${selectedToken.symbol}`
-  const accountSummary = getLinkedAccountSummary()
-  const energyRequired = totals.totalEnergy
-  const energyInsufficient =
-    accountSummary.linked &&
-    accountSummary.energyBalance != null &&
-    accountSummary.energyBalance < energyRequired
-  const energyBalanceRow = accountSummary.linked
-    ? `<div class="meta-row"><span class="meta-label">Your Energy</span><span class="meta-value">${formatEnergyPriceHtml(
-        accountSummary.energyBalance != null ? accountSummary.energyBalance : 0,
-      )}${accountSummary.energyBalance == null ? ' <span class="muted-inline">(syncing)</span>' : ''}</span></div>`
-    : ''
-  const energyWarnHtml = energyInsufficient
-    ? `<div class="alert alert-warn">Insufficient Energy balance. MiniPay stablecoin checkout is still available.</div>`
-    : ''
 
-  const tokenSelectorHtml = inMiniPay && minipayEnabled && !missingPrice
+  const draft = getCheckoutDraft()
+  const showDetailsSummary =
+    !state.checkoutEditingDetails && checkoutDraftIsComplete(draft)
+
+  const preview = previewEnergyDiscount(state.requestedEnergyDiscount || 0)
+  const remainingLabel = `${formatCusdAmount(preview.remainingCrypto)} ${selectedToken.symbol}`
+  const productTotalLabel = `${formatCusdAmount(totals.usdTotal)} USD`
+  const discountActive = preview.appliedEnergy > 0
+
+  const energyBalanceRow = renderCheckoutEnergyBalanceHtml()
+
+  const tokenSelectorHtml = minipayEnabled && !missingPrice
     ? `
       <div class="token-selector" role="radiogroup" aria-label="Pay with stablecoin">
         <div class="token-selector-label">Pay with</div>
@@ -1860,36 +2231,80 @@ function renderCheckoutForm(main) {
             return `<button type="button" class="token-chip ${active ? 'active' : ''}" data-payment-token="${symbol}" role="radio" aria-checked="${active}">${symbol}</button>`
           }).join('')}
         </div>
-        <p class="token-selector-hint">Same USD price. MiniPay accepts USDT, USDC, and cUSD on Celo.</p>
+        <p class="token-selector-hint">Choose a MiniPay stablecoin. Final payment is verified on Celo.</p>
       </div>
     `
     : ''
+
+  const discountSummaryHtml = `
+    <div class="payment-summary">
+      <div class="meta-row"><span class="meta-label">Product total</span><span class="meta-value">${escapeHtml(productTotalLabel)}</span></div>
+      <div class="meta-row"><span class="meta-label">Energy discount</span><span class="meta-value">${
+        discountActive
+          ? `${formatEnergyPriceHtml(preview.appliedEnergy)} → ${formatPhpAmount(preview.discountPhp)} (−${formatCusdAmount(preview.discountCrypto)} USD)`
+          : 'None'
+      }</span></div>
+      ${
+        state.energyDiscountStatus && state.energyDiscountStatus !== 'none'
+          ? `<div class="meta-row"><span class="meta-label">Discount status</span><span class="meta-value">${escapeHtml(energyDiscountStatusLabel(state.energyDiscountStatus))}</span></div>`
+          : ''
+      }
+      <div class="meta-row"><span class="meta-label">Remaining to pay</span><span class="meta-value"><strong>${escapeHtml(remainingLabel)}</strong></span></div>
+      <p class="token-selector-hint">Energy is reserved when you start MiniPay checkout (default max ${escapeHtml(String(preview.maxPct ?? 20))}% · 10 Energy = ₱1). If checkout expires, reserved Energy is released.</p>
+    </div>
+  `
+
+  const deliverySectionHtml = showDetailsSummary
+    ? `
+      <section class="card" id="checkout-form-card">
+        <div class="checkout-details-header">
+          <h3 style="margin:0;font-size:15px">Delivery details</h3>
+          <button type="button" class="btn btn-ghost btn-edit-details" id="edit-checkout-details">Edit details</button>
+        </div>
+        <div class="checkout-details-summary">
+          <div class="meta-row"><span class="meta-label">Name</span><span class="meta-value">${escapeHtml(draft.customer_name)}</span></div>
+          <div class="meta-row"><span class="meta-label">Phone</span><span class="meta-value">${escapeHtml(draft.phone_number)}</span></div>
+          <div class="meta-row"><span class="meta-label">Email</span><span class="meta-value">${escapeHtml(draft.email)}</span></div>
+          <div class="meta-row"><span class="meta-label">Address</span><span class="meta-value">${escapeHtml(draft.delivery_address)}</span></div>
+          <div class="meta-row"><span class="meta-label">Comments</span><span class="meta-value">${escapeHtml(draft.comments || '—')}</span></div>
+        </div>
+        <div id="checkout-status"></div>
+      </section>
+    `
+    : `
+      <section class="card" id="checkout-form-card">
+        <div class="checkout-details-header">
+          <h3 style="margin:0;font-size:15px">Delivery details</h3>
+          ${
+            checkoutDraftIsComplete(draft)
+              ? `<button type="button" class="btn btn-ghost btn-edit-details" id="save-checkout-details">Save details</button>`
+              : ''
+          }
+        </div>
+        <form id="checkout-form">
+          <div class="form-group"><label for="customer_name">Full name</label><input id="customer_name" name="customer_name" required autocomplete="name" value="${escapeHtml(draft.customer_name)}" /></div>
+          <div class="form-group"><label for="phone_number">Phone</label><input id="phone_number" name="phone_number" required autocomplete="tel" value="${escapeHtml(draft.phone_number)}" /></div>
+          <div class="form-group"><label for="email">Email</label><input id="email" name="email" type="email" required autocomplete="email" value="${escapeHtml(draft.email)}" /></div>
+          <div class="form-group"><label for="delivery_address">Delivery address (Philippines)</label><textarea id="delivery_address" name="delivery_address" required>${escapeHtml(draft.delivery_address)}</textarea></div>
+          <div class="form-group"><label for="comments">Comments (optional)</label><textarea id="comments" name="comments">${escapeHtml(draft.comments)}</textarea></div>
+        </form>
+        <div id="checkout-status"></div>
+      </section>
+    `
 
   main.innerHTML = `
     <button type="button" class="btn btn-ghost" id="back-cart">← Back to cart</button>
     <section class="card">
       <h2 class="detail-title" style="font-size:17px">Checkout</h2>
       <div class="checkout-summary">${renderCheckoutSummaryHtml(totals)}</div>
-      <div class="meta-row"><span class="meta-label">Total Energy</span><span class="meta-value">${formatEnergyPriceHtml(totals.totalEnergy)}</span></div>
       ${energyBalanceRow}
-      <div class="meta-row"><span class="meta-label">Stablecoin total</span><span class="meta-value">${escapeHtml(totals.cryptoSubtotal)}</span></div>
+      ${discountSummaryHtml}
       <div class="meta-row"><span class="meta-label">Delivery</span><span class="meta-value">Philippines only</span></div>
       ${tokenSelectorHtml}
     </section>
-    <section class="card" id="checkout-form-card">
-      <h3 style="margin:0 0 12px;font-size:15px">Delivery details</h3>
-      <form id="checkout-form">
-        <div class="form-group"><label for="customer_name">Full name</label><input id="customer_name" name="customer_name" required autocomplete="name" /></div>
-        <div class="form-group"><label for="phone_number">Phone</label><input id="phone_number" name="phone_number" required autocomplete="tel" /></div>
-        <div class="form-group"><label for="email">Email</label><input id="email" name="email" type="email" required autocomplete="email" /></div>
-        <div class="form-group"><label for="delivery_address">Delivery address (Philippines)</label><textarea id="delivery_address" name="delivery_address" required></textarea></div>
-        <div class="form-group"><label for="comments">Comments (optional)</label><textarea id="comments" name="comments"></textarea></div>
-      </form>
-      <div id="checkout-status"></div>
-    </section>
+    ${deliverySectionHtml}
     <section class="card">
-      <div class="alert alert-info">Energy redemption on web uses your linked Move+ account. MiniPay crypto checkout works without linking.</div>
-      ${energyWarnHtml}
+      <div class="alert alert-info">Energy can reduce your total after you link your Move+ account. MiniPay pays the remaining balance in ${escapeHtml(selectedToken.symbol)}.</div>
       ${
         minipayBlockedReason
           ? `<div class="alert alert-warn">${escapeHtml(minipayBlockedReason)}</div>`
@@ -1897,54 +2312,246 @@ function renderCheckoutForm(main) {
       }
       ${
         !inMiniPay
-          ? `<div class="alert alert-warn">Wallet signing is unavailable in a normal browser. Open inside MiniPay to pay with crypto.</div>`
+          ? `<div class="alert alert-warn">Open inside MiniPay to pay.</div>`
           : minipayEnabled
-            ? `<div class="alert alert-info">MiniPay detected. Choose USDT, USDC, or cUSD to pay.</div>`
+            ? `<div class="alert alert-info">MiniPay detected. Pay with ${escapeHtml(selectedToken.symbol)} on Celo.</div>`
             : `<div class="alert alert-warn">MiniPay checkout is coming soon.</div>`
       }
     </section>
     ${diagnosticsHtml()}
     <div class="action-bar" id="checkout-actions">
-      <button type="button" class="btn btn-energy" id="energy-info-btn">Pay with ENERGY</button>
+      <button type="button" class="btn btn-energy" id="apply-energy-discount-btn">Apply Energy Discount</button>
       <button type="button" class="btn btn-primary ${!minipayReady ? 'btn-disabled' : ''}" id="minipay-checkout-btn" ${!minipayReady ? 'disabled' : ''}>
-        ${minipayReady ? payLabel : 'Open inside MiniPay to pay'}
+        ${minipayReady ? 'Pay with MiniPay' : 'Open inside MiniPay to pay'}
       </button>
     </div>
   `
 
-  document.getElementById('back-cart')?.addEventListener('click', () => setView('cart'))
-  document.getElementById('energy-info-btn')?.addEventListener('click', () => {
-    handleEnergyPayClick(energyRequired)
+  document.getElementById('back-cart')?.addEventListener('click', () => {
+    captureCheckoutDeliveryState()
+    setView('cart')
   })
-  document.getElementById('minipay-checkout-btn')?.addEventListener('click', () => startMinipayCheckout())
+  document.getElementById('edit-checkout-details')?.addEventListener('click', () => {
+    state.checkoutEditingDetails = true
+    render()
+  })
+  document.getElementById('save-checkout-details')?.addEventListener('click', () => {
+    const form = document.getElementById('checkout-form')
+    if (form && typeof form.reportValidity === 'function' && !form.reportValidity()) {
+      return
+    }
+    captureCheckoutDeliveryState({ collapseIfComplete: true })
+    if (!checkoutDraftIsComplete(state.checkoutDraft)) {
+      showToast('Complete required delivery fields.', null, null)
+      return
+    }
+    render()
+  })
+  document.getElementById('apply-energy-discount-btn')?.addEventListener('click', () => {
+    captureCheckoutDeliveryState({ collapseIfComplete: true })
+    openApplyEnergyDiscountModal(preview)
+  })
+  document.getElementById('minipay-checkout-btn')?.addEventListener('click', () => {
+    captureCheckoutDeliveryState({ collapseIfComplete: true })
+    startMinipayCheckout()
+  })
   main.querySelectorAll('[data-payment-token]').forEach((btn) => {
     btn.addEventListener('click', () => {
       const symbol = btn.getAttribute('data-payment-token')
       if (!resolvePaymentToken(symbol)) return
+      captureCheckoutDeliveryState()
       state.selectedPaymentToken = symbol
       render()
     })
   })
 
-  // Refresh live prices in background; pick default token by balance once.
-  ensureCatalogFreshForCheckout().then(async () => {
+  const checkoutFormEl = document.getElementById('checkout-form')
+  if (checkoutFormEl) bindCheckoutDraftAutosave(checkoutFormEl)
+  bindCheckoutEnergyBalanceActions()
+
+  // Sync linked Energy balance when entering / refreshing checkout.
+  void ensureMovePlusEnergyBalanceForCheckout().then((bal) => {
     if (state.view !== 'checkout') return
-    const refreshed = getCartTotals()
-    const priceChanged = refreshed.cryptoSubtotal !== totals.cryptoSubtotal
-    if (priceChanged || cartHasUnavailableItems()) {
-      render()
-      return
-    }
-    if (inMiniPay && !state._tokenDefaultPicked) {
-      state._tokenDefaultPicked = true
-      const wallet = state.minipayWalletAddress || (await prepareMiniPayWallet())
-      const preferred = await pickDefaultPaymentToken(wallet)
-      if (preferred && preferred !== state.selectedPaymentToken) {
-        state.selectedPaymentToken = preferred
+    // Re-render when status changes from loading → ready/error (or after late ready).
+    const status = state.movePlusSession?.balanceStatus
+    if (status === 'ready' || status === 'error' || status === 'expired') {
+      captureCheckoutDeliveryState()
+      // Avoid loops: only re-render if displayed balance wasn't already ready with same value.
+      if (!state._checkoutEnergyRenderedFor || state._checkoutEnergyRenderedFor !== `${status}:${bal}`) {
+        state._checkoutEnergyRenderedFor = `${status}:${bal}`
         render()
       }
     }
   })
+
+  ensureCatalogFreshForCheckout().then(async () => {
+    if (state.view !== 'checkout') return
+    const hadSettings = Boolean(state.paymentSettings)
+    await loadPaymentSettings()
+    const refreshed = getCartTotals()
+    const priceChanged = refreshed.cryptoSubtotal !== totals.cryptoSubtotal
+    if (priceChanged || cartHasUnavailableItems()) {
+      captureCheckoutDeliveryState()
+      render()
+      return
+    }
+    // Keep default cUSD unless user already picked another token.
+    // Balance-based auto-pick only when still on default and user has no balance of it.
+    if (inMiniPay && !state._tokenDefaultPicked) {
+      state._tokenDefaultPicked = true
+      if (state.selectedPaymentToken === 'cUSD') {
+        const wallet = state.minipayWalletAddress || (await prepareMiniPayWallet())
+        const preferred = await pickDefaultPaymentToken(wallet)
+        if (preferred && preferred !== state.selectedPaymentToken) {
+          captureCheckoutDeliveryState()
+          state.selectedPaymentToken = preferred
+          render()
+          return
+        }
+      }
+    }
+    if (!hadSettings && state.paymentSettings) {
+      captureCheckoutDeliveryState()
+      render()
+    }
+  })
+}
+
+function openApplyEnergyDiscountModal(preview) {
+  captureCheckoutDeliveryState({ collapseIfComplete: true })
+
+  if (!cartAllowsEnergyDiscount()) {
+    openModal({
+      title: 'Energy discount unavailable',
+      bodyElement: buildAccountModalBody(
+        'One or more items in your cart do not allow Energy discount.',
+        ['Pay the full stablecoin amount with MiniPay.'],
+      ),
+      primaryLabel: 'OK',
+      primaryAction: closeModal,
+      secondaryLabel: null,
+      secondaryAction: null,
+    })
+    return
+  }
+
+  const session = state.movePlusSession || {}
+  const linked = Boolean(session.linked) || isMoveplusAccountLinked()
+  const status = session.balanceStatus || (linked ? 'loading' : 'idle')
+
+  if (!linked || status === 'expired' || status === 'idle') {
+    openModal({
+      title: status === 'expired' ? 'Session expired' : 'Link Move+ Account',
+      bodyElement: buildAccountModalBody(
+        status === 'expired'
+          ? 'Your Move+ session expired. Re-link to apply an Energy discount.'
+          : 'Link your Move+ account to apply an Energy discount on Real Items.',
+        [
+          'Energy is a partial discount only (default max 20%).',
+          'MiniPay crypto checkout still works without linking.',
+        ],
+      ),
+      primaryLabel: status === 'expired' ? 'Re-link' : 'Link account',
+      primaryAction: () => openLinkMoveplusAccountModal(),
+      secondaryLabel: 'Not now',
+      secondaryAction: closeModal,
+    })
+    return
+  }
+
+  const renderDiscountModalBody = (livePreview) => {
+    const body = document.createElement('div')
+    const st = state.movePlusSession?.balanceStatus || 'loading'
+    const maxPct = livePreview.maxPct ?? 20
+
+    if (st === 'loading') {
+      body.innerHTML = `
+        <p class="modal-lead">Apply Energy as a discount (max ${escapeHtml(String(maxPct))}% · 10 Energy = ₱1).</p>
+        <p class="modal-note">Syncing your Energy…</p>
+        <p class="modal-note">Server recalculates the final discount. Client totals are never trusted.</p>
+      `
+      return body
+    }
+
+    if (st === 'error') {
+      body.innerHTML = `
+        <p class="modal-lead">Apply Energy as a discount (max ${escapeHtml(String(maxPct))}% · 10 Energy = ₱1).</p>
+        <p class="modal-note">Could not sync Energy balance.</p>
+        <button type="button" class="btn btn-secondary" id="energy-discount-retry-btn" style="margin-top:10px">Retry</button>
+        <p class="modal-note">Server recalculates the final discount. Client totals are never trusted.</p>
+      `
+      body.querySelector('#energy-discount-retry-btn')?.addEventListener('click', () => {
+        void fetchMovePlusEnergyBalance({ force: true, silent: false }).then(() => {
+          openApplyEnergyDiscountModal(previewEnergyDiscount(state.requestedEnergyDiscount || 0))
+        })
+      })
+      return body
+    }
+
+    const maxEnergy = livePreview.maxEnergy || 0
+    const balLabel = formatEnergyBalanceLabel(livePreview.balance)
+    body.innerHTML = `
+      <p class="modal-lead">Apply Energy as a discount (max ${escapeHtml(String(maxPct))}% · 10 Energy = ₱1).</p>
+      <p class="modal-note">Your balance: ${escapeHtml(balLabel)} · Max usable: ${escapeHtml(String(maxEnergy))}</p>
+      <div class="form-group" style="margin-top:10px">
+        <label for="energy-discount-input">Energy to apply</label>
+        <input id="energy-discount-input" type="number" min="0" max="${maxEnergy}" step="1" value="${Math.min(state.requestedEnergyDiscount || 0, maxEnergy)}" inputmode="numeric" ${livePreview.canApply ? '' : 'disabled'} />
+      </div>
+      <p class="modal-note">Server recalculates the final discount. Client totals are never trusted.</p>
+    `
+    return body
+  }
+
+  const live = previewEnergyDiscount(state.requestedEnergyDiscount || 0)
+  const canApplyNow = live.canApply === true
+
+  openModal({
+    title: 'Apply Energy Discount',
+    bodyElement: renderDiscountModalBody(live),
+    primaryLabel: canApplyNow ? 'Apply' : null,
+    primaryAction: canApplyNow
+      ? () => {
+          const ready = previewEnergyDiscount(state.requestedEnergyDiscount || 0)
+          if (!ready.canApply) {
+            showToast('Energy balance is not ready yet.', null, null)
+            return
+          }
+          const raw = document.getElementById('energy-discount-input')?.value
+          const n = Math.max(0, Math.floor(Number(raw) || 0))
+          state.requestedEnergyDiscount = Math.min(n, ready.maxEnergy || 0)
+          captureCheckoutDeliveryState({ collapseIfComplete: true })
+          showToast(
+            state.requestedEnergyDiscount > 0
+              ? `Energy discount set: ${state.requestedEnergyDiscount} ENERGY`
+              : 'Energy discount cleared.',
+            null,
+            null,
+          )
+          render()
+        }
+      : null,
+    secondaryLabel: canApplyNow ? 'Clear' : 'Close',
+    secondaryAction: canApplyNow
+      ? () => {
+          state.requestedEnergyDiscount = 0
+          captureCheckoutDeliveryState({ collapseIfComplete: true })
+          render()
+        }
+      : closeModal,
+  })
+
+  // If still loading, fetch then reopen modal with ready balance (preserve delivery draft).
+  if (status === 'loading' || (linked && session.energyBalance == null && status !== 'error' && status !== 'ready')) {
+    if (!state._energyDiscountModalAwaitingSync) {
+      state._energyDiscountModalAwaitingSync = true
+      void fetchMovePlusEnergyBalance({ force: true, silent: true }).finally(() => {
+        state._energyDiscountModalAwaitingSync = false
+        captureCheckoutDeliveryState({ collapseIfComplete: true })
+        if (state.view === 'checkout') render()
+        openApplyEnergyDiscountModal(previewEnergyDiscount(state.requestedEnergyDiscount || 0))
+      })
+    }
+  }
 }
 
 async function startMinipayCheckout() {
@@ -1956,7 +2563,7 @@ async function startMinipayCheckout() {
     showToast(message, null, null)
     if (payBtn) {
       payBtn.disabled = false
-      payBtn.textContent = `Pay with ${selectedToken.symbol}`
+      payBtn.textContent = 'Pay with MiniPay'
     }
   }
 
@@ -2014,28 +2621,49 @@ async function startMinipayCheckout() {
     return
   }
 
+  saveCheckoutDraftFromDom()
+  const draft = getCheckoutDraft()
   const form = document.getElementById('checkout-form')
-  if (!form) {
-    fail('Checkout form is missing. Reload and try again.', 'blocked-missing-form')
-    return
-  }
-  if (!form.reportValidity()) {
-    setPaymentDebug({ step: 'form-invalid', lastError: 'Delivery form incomplete' })
-    if (payBtn) {
-      payBtn.disabled = false
-      payBtn.textContent = `Pay with ${selectedToken.symbol}`
+  if (state.checkoutEditingDetails && form && typeof form.reportValidity === 'function') {
+    if (!form.reportValidity()) {
+      setPaymentDebug({ step: 'form-invalid', lastError: 'Delivery form incomplete' })
+      if (payBtn) {
+        payBtn.disabled = false
+        payBtn.textContent = 'Pay with MiniPay'
+      }
+      return
     }
+    captureCheckoutDeliveryState({ collapseIfComplete: true })
+  } else if (!checkoutDraftIsComplete(draft)) {
+    state.checkoutEditingDetails = true
+    fail('Complete delivery details before paying.', 'form-invalid')
+    render()
     return
   }
 
+  const finalDraft = getCheckoutDraft()
+  if (!checkoutDraftIsComplete(finalDraft)) {
+    state.checkoutEditingDetails = true
+    fail('Complete delivery details before paying.', 'form-invalid')
+    render()
+    return
+  }
   const body = {
     items: buildCheckoutItemsPayload(),
-    customer_name: form.customer_name.value.trim(),
-    phone_number: form.phone_number.value.trim(),
-    email: form.email.value.trim(),
-    delivery_address: form.delivery_address.value.trim(),
-    comments: form.comments.value.trim() || null,
+    customer_name: finalDraft.customer_name,
+    phone_number: finalDraft.phone_number,
+    email: finalDraft.email,
+    delivery_address: finalDraft.delivery_address,
+    comments: finalDraft.comments || null,
     payment_token_symbol: selectedToken.symbol,
+    requested_energy_discount: Math.max(
+      0,
+      Math.floor(Number(state.requestedEnergyDiscount) || 0),
+    ),
+  }
+  const webSession = getStoredWebSession()
+  if (webSession?.session_token) {
+    body.marketplace_session_token = webSession.session_token
   }
 
   if (payBtn) payBtn.textContent = 'Creating checkout…'
@@ -2081,6 +2709,22 @@ async function startMinipayCheckout() {
       expiresAt: data.expires_at,
       cartItems: data.cart_items ?? null,
       totalQuantity: data.total_quantity ?? null,
+      energyDiscountStatus: data.energy_discount_status || 'none',
+      energyDiscountEnergy: Math.max(
+        0,
+        Math.floor(Number(data.energy_discount?.applied_energy ?? data.energy_discount_energy ?? 0) || 0),
+      ),
+      energyDiscountReservationId: data.energy_discount_reservation_id || null,
+    }
+
+    state.energyDiscountStatus = session.energyDiscountStatus
+    if (session.energyDiscountStatus === 'reserved') {
+      void fetchMovePlusEnergyBalance({ force: true, silent: true })
+      showToast(
+        `Energy discount reserved: ${session.energyDiscountEnergy} ENERGY`,
+        null,
+        null,
+      )
     }
 
     if (!session.treasuryAddress || !session.tokenAddress || session.amountRaw == null) {
@@ -2126,7 +2770,7 @@ function renderPayment(main) {
 
   const inMiniPay = isMiniPayWallet()
   const tokenSymbol = session.tokenSymbol || getSelectedPaymentToken().symbol
-  const payLabel = inMiniPay ? `Pay with ${tokenSymbol}` : 'Open inside MiniPay to pay'
+  const payLabel = inMiniPay ? 'Pay with MiniPay' : 'Open inside MiniPay to pay'
   const autoPay = state.autoPayAfterSession
   state.autoPayAfterSession = false
 
@@ -2139,6 +2783,11 @@ function renderPayment(main) {
       <div class="meta-row"><span class="meta-label">Token</span><span class="meta-value">${escapeHtml(tokenSymbol)}</span></div>
       <div class="meta-row"><span class="meta-label">Network</span><span class="meta-value">${escapeHtml(session.chainName || 'Celo')}</span></div>
       <div class="meta-row"><span class="meta-label">Delivery</span><span class="meta-value">Philippines only</span></div>
+      ${
+        session.energyDiscountEnergy > 0
+          ? `<div class="meta-row"><span class="meta-label">Energy discount</span><span class="meta-value">${escapeHtml(String(session.energyDiscountEnergy))} ENERGY · ${escapeHtml(energyDiscountStatusLabel(session.energyDiscountStatus || state.energyDiscountStatus))}</span></div>`
+          : ''
+      }
       <div class="meta-row"><span class="meta-label">Status</span><span class="meta-value" id="checkout-live-status">pending</span></div>
     </section>
     ${
@@ -2391,19 +3040,29 @@ async function confirmMinipayPayment(session) {
 
     setPaymentDebug({ step: 'payment-successful', lastError: null })
     if (liveStatus) liveStatus.textContent = 'paid'
-    showPaymentStatus(`<div class="alert alert-info">Payment successful</div>`)
+    showPaymentStatus(
+      verifyData.fulfillment_review_required
+        ? `<div class="alert alert-warn">${escapeHtml(verifyData.warning || 'Payment verified — Energy discount needs review before fulfillment.')}</div>`
+        : `<div class="alert alert-info">Payment successful</div>`,
+    )
     state.paymentInFlight = false
 
+    // Reserved Energy is redeemed (or review-flagged) server-side — refresh balance.
+    void fetchMovePlusEnergyBalance({ force: true, silent: true })
+
     setView('paid', {
-      session: {
-        ...session,
-        txHash: verifyData.tx_hash || String(txHash),
-        explorerUrl: verifyData.explorer_url,
-        receiptTxHash: verifyData.receipt_tx_hash ?? null,
-        receiptExplorerUrl: verifyData.receipt_explorer_url ?? null,
-        receiptPending: verifyData.receipt_pending === true,
-        receiptRecorded: verifyData.receipt_recorded === true || Boolean(verifyData.receipt_tx_hash),
-      },
+      session: applyPaidSessionEnergyFields(
+        {
+          ...session,
+          txHash: verifyData.tx_hash || String(txHash),
+          explorerUrl: verifyData.explorer_url,
+          receiptTxHash: verifyData.receipt_tx_hash ?? null,
+          receiptExplorerUrl: verifyData.receipt_explorer_url ?? null,
+          receiptPending: verifyData.receipt_pending === true,
+          receiptRecorded: verifyData.receipt_recorded === true || Boolean(verifyData.receipt_tx_hash),
+        },
+        verifyData,
+      ),
     })
     clearCart()
   } catch (err) {
@@ -2411,6 +3070,11 @@ async function confirmMinipayPayment(session) {
     logDebug('payment error raw', err)
     if (isDebugMode()) {
       setPaymentDebug({ lastError: raw })
+    }
+    if (/expired|Energy discount was released/i.test(raw)) {
+      state.requestedEnergyDiscount = 0
+      state.energyDiscountStatus = 'released'
+      void fetchMovePlusEnergyBalance({ force: true, silent: true })
     }
     if (isUserCancelledWalletError(err)) {
       fail('Payment cancelled', 'payment-cancelled')
@@ -2435,19 +3099,29 @@ function renderPaid(main) {
   const session = state.checkoutSession
   const receiptPending = session?.receiptPending === true
   const hasReceipt = Boolean(session?.receiptTxHash)
+  const reviewRequired = session?.fulfillmentReviewRequired === true
 
   main.innerHTML = `
     <section class="card">
-      <h2 class="detail-title" style="font-size:17px;color:var(--accent)">Payment verified</h2>
+      <h2 class="detail-title" style="font-size:17px;color:var(--accent)">${
+        reviewRequired ? 'Payment verified — review required' : 'Payment verified'
+      }</h2>
       ${
-        hasReceipt
-          ? `<p class="detail-desc">Receipt recorded on Celo. Your order is pending fulfillment.</p>`
-          : receiptPending
-            ? `<p class="detail-desc">Payment verified. On-chain receipt is pending — your order is confirmed and awaiting fulfillment.</p>`
-            : `<p class="detail-desc">Your order is pending fulfillment. Thank you for shopping with Move+.</p>`
+        reviewRequired
+          ? `<p class="detail-desc">${escapeHtml(session?.warning || 'Payment was received, but Energy discount settlement needs Move+ review before fulfillment.')}</p>`
+          : hasReceipt
+            ? `<p class="detail-desc">Receipt recorded on Celo. Your order is pending fulfillment.</p>`
+            : receiptPending
+              ? `<p class="detail-desc">Payment verified. On-chain receipt is pending — your order is confirmed and awaiting fulfillment.</p>`
+              : `<p class="detail-desc">Your order is pending fulfillment. Thank you for shopping with Move+.</p>`
       }
       <div class="meta-row"><span class="meta-label">Product</span><span class="meta-value">${escapeHtml(session?.itemTitle || '—')}</span></div>
       <div class="meta-row"><span class="meta-label">Amount</span><span class="meta-value">${escapeHtml(session?.amountDisplay || '—')} ${escapeHtml(session?.tokenSymbol || '')}</span></div>
+      ${
+        session?.energyDiscountEnergy > 0
+          ? `<div class="meta-row"><span class="meta-label">Energy discount</span><span class="meta-value">${escapeHtml(String(session.energyDiscountEnergy))} ENERGY · ${escapeHtml(energyDiscountStatusLabel(session.energyDiscountStatus))}</span></div>`
+          : ''
+      }
       ${
         session?.txHash
           ? `<div class="meta-row"><span class="meta-label">Payment tx</span><span class="meta-value">${session.explorerUrl ? `<a class="tx-link" href="${escapeHtml(session.explorerUrl)}" target="_blank" rel="noopener">${shortAddr(session.txHash)}</a>` : shortAddr(session.txHash)}</span></div>`
@@ -2459,9 +3133,11 @@ function renderPaid(main) {
           : ''
       }
       ${
-        receiptPending && !hasReceipt
-          ? `<div class="alert alert-info" style="margin-top:12px">On-chain receipt may be recorded later by Move+. No action needed from you.</div>`
-          : ''
+        reviewRequired
+          ? `<div class="alert alert-warn" style="margin-top:12px">Move+ will review Energy settlement before shipping. Keep your payment tx hash.</div>`
+          : receiptPending && !hasReceipt
+            ? `<div class="alert alert-info" style="margin-top:12px">On-chain receipt may be recorded later by Move+. No action needed from you.</div>`
+            : ''
       }
     </section>
     <button type="button" class="btn btn-primary" id="back-shop">Back to catalog</button>
@@ -2470,6 +3146,7 @@ function renderPaid(main) {
   document.getElementById('back-shop')?.addEventListener('click', () => {
     state.checkoutSession = null
     state.selectedItem = null
+    state.energyDiscountStatus = 'none'
     clearCart()
     setView('catalog')
   })
@@ -2525,6 +3202,11 @@ function render() {
   const main = document.getElementById('main')
   if (!main) return
 
+  // Persist delivery fields before any checkout DOM rebuild.
+  if (state.view === 'checkout' || document.getElementById('checkout-form')) {
+    saveCheckoutDraftFromDom()
+  }
+
   if (state.view === 'catalog') renderCatalog(main)
   else if (state.view === 'detail') renderDetail(main)
   else if (state.view === 'cart') renderCart(main)
@@ -2549,7 +3231,16 @@ function boot() {
   syncSearchPlaceholder()
   loadCatalog()
 
-  // Account link: refresh marketplace capability session (no Supabase JWT retained).
+  // Account link + payment settings for Energy discount preview.
+  void loadPaymentSettings()
+  hydrateMovePlusSessionToken()
+  void fetchMovePlusEnergyBalance({ force: true, silent: true }).then(() => {
+    if (state.view === 'checkout') {
+      captureCheckoutDeliveryState()
+      render()
+    }
+    syncAccountHeaderButton()
+  })
   void refreshLinkedAccountSummary({ silent: true })
 
   if (window.ethereum && typeof window.ethereum.on === 'function') {
@@ -2664,6 +3355,15 @@ function clearLinkedAccountLocal() {
   } catch (_) {
     /* ignore */
   }
+  state.movePlusSession = {
+    linked: false,
+    token: null,
+    energyBalance: null,
+    balanceStatus: 'idle',
+    balanceError: null,
+    updatedAt: null,
+    sessionExpiresAt: null,
+  }
 }
 
 function stripStaleLinkTokenFromUrl() {
@@ -2676,6 +3376,247 @@ function stripStaleLinkTokenFromUrl() {
   } catch (_) {
     /* ignore */
   }
+}
+
+function hydrateMovePlusSessionToken() {
+  const session = getStoredWebSession()
+  if (!session?.session_token) {
+    if (state.movePlusSession?.balanceStatus !== 'expired') {
+      state.movePlusSession = {
+        linked: false,
+        token: null,
+        energyBalance: null,
+        balanceStatus: 'idle',
+        balanceError: null,
+        updatedAt: null,
+        sessionExpiresAt: null,
+      }
+    }
+    return null
+  }
+  state.movePlusSession = {
+    ...state.movePlusSession,
+    linked: true,
+    token: session.session_token,
+    sessionExpiresAt: session.expires_at || state.movePlusSession.sessionExpiresAt,
+  }
+  return session
+}
+
+/**
+ * Fetch current Energy balance for linked marketplace session.
+ * Backend is source of truth — never trust a cached frontend balance for deduction.
+ */
+async function fetchMovePlusEnergyBalance({ force = false, silent = true } = {}) {
+  const session = hydrateMovePlusSessionToken()
+  if (!session?.session_token) {
+    state.movePlusSession = {
+      linked: false,
+      token: null,
+      energyBalance: null,
+      balanceStatus: 'idle',
+      balanceError: null,
+      updatedAt: null,
+      sessionExpiresAt: null,
+    }
+    return null
+  }
+
+  if (
+    !force &&
+    state.movePlusSession.balanceStatus === 'loading' &&
+    state._energyBalanceFetchPromise
+  ) {
+    return state._energyBalanceFetchPromise
+  }
+
+  state.movePlusSession = {
+    ...state.movePlusSession,
+    linked: true,
+    token: session.session_token,
+    balanceStatus: 'loading',
+    balanceError: null,
+  }
+
+  const run = (async () => {
+    const fn = cfg().energyBalanceFunction || 'marketplace-energy-balance'
+    try {
+      const { status, data } = await invokeFunction(fn, {
+        marketplace_session_token: session.session_token,
+        session_token: session.session_token,
+      })
+
+      if (status === 401 || data?.error_code === 'SESSION_EXPIRED' || data?.error_code === 'SESSION_REVOKED') {
+        clearLinkedAccountLocal()
+        state.movePlusSession = {
+          linked: false,
+          token: null,
+          energyBalance: null,
+          balanceStatus: 'expired',
+          balanceError: data?.error || 'Session expired',
+          updatedAt: null,
+          sessionExpiresAt: null,
+        }
+        syncAccountHeaderButton()
+        if (!silent) showToast('Session expired. Sign in again to link your Move+ account.', null, null)
+        return null
+      }
+
+      if (status >= 200 && status < 300 && data?.success && data.linked === true) {
+        if (data.session_expires_at) {
+          persistWebSession(session.session_token, data.session_expires_at)
+        }
+        const energyBalance = Math.max(0, Math.floor(Number(data.energy_balance) || 0))
+        state.movePlusSession = {
+          linked: true,
+          token: session.session_token,
+          energyBalance,
+          balanceStatus: 'ready',
+          balanceError: null,
+          updatedAt: data.energy_balance_updated_at || new Date().toISOString(),
+          sessionExpiresAt: data.session_expires_at || session.expires_at || null,
+        }
+        // Keep account-sheet summary in sync when energy-only endpoint succeeds.
+        try {
+          const raw = sessionStorage.getItem(ACCOUNT_SUMMARY_SESSION_KEY)
+          const prev = raw ? JSON.parse(raw) : {}
+          sessionStorage.setItem(
+            ACCOUNT_SUMMARY_SESSION_KEY,
+            JSON.stringify({
+              ...(prev && typeof prev === 'object' ? prev : {}),
+              energy_balance: energyBalance,
+            }),
+          )
+        } catch (_) {
+          /* ignore */
+        }
+        syncAccountHeaderButton()
+        return energyBalance
+      }
+
+      if (status >= 200 && status < 300 && data?.linked === false) {
+        clearLinkedAccountLocal()
+        state.movePlusSession = {
+          linked: false,
+          token: null,
+          energyBalance: null,
+          balanceStatus: data?.error_code === 'SESSION_EXPIRED' ? 'expired' : 'idle',
+          balanceError: data?.error || null,
+          updatedAt: null,
+          sessionExpiresAt: null,
+        }
+        syncAccountHeaderButton()
+        return null
+      }
+
+      state.movePlusSession = {
+        ...state.movePlusSession,
+        linked: true,
+        token: session.session_token,
+        energyBalance: null,
+        balanceStatus: 'error',
+        balanceError:
+          (data && (data.error || data.message)) || `Could not sync Energy (${status})`,
+      }
+      if (!silent) showToast(state.movePlusSession.balanceError, null, null)
+      return null
+    } catch (err) {
+      state.movePlusSession = {
+        ...state.movePlusSession,
+        linked: true,
+        token: session.session_token,
+        energyBalance: null,
+        balanceStatus: 'error',
+        balanceError: err?.message || 'Could not sync Energy balance',
+      }
+      if (!silent) showToast(state.movePlusSession.balanceError, null, null)
+      return null
+    } finally {
+      state._energyBalanceFetchPromise = null
+    }
+  })()
+
+  state._energyBalanceFetchPromise = run
+  return run
+}
+
+async function ensureMovePlusEnergyBalanceForCheckout({ force = false } = {}) {
+  hydrateMovePlusSessionToken()
+  if (!state.movePlusSession.linked && !getStoredWebSession()) return null
+  if (
+    !force &&
+    state.movePlusSession.balanceStatus === 'ready' &&
+    state.movePlusSession.energyBalance != null
+  ) {
+    return state.movePlusSession.energyBalance
+  }
+  return fetchMovePlusEnergyBalance({ force, silent: true })
+}
+
+function renderCheckoutEnergyBalanceHtml() {
+  const session = state.movePlusSession || {}
+  const linked = Boolean(session.linked) || isMoveplusAccountLinked()
+  const status = session.balanceStatus || 'idle'
+
+  if (!linked && status !== 'expired') {
+    return `<div class="meta-row energy-balance-row">
+      <span class="meta-label">Your Energy</span>
+      <span class="meta-value">
+        <button type="button" class="btn btn-ghost btn-inline-link" id="checkout-link-account-btn">Link Move+ account</button>
+      </span>
+    </div>`
+  }
+
+  if (status === 'loading' || status === 'idle') {
+    return `<div class="meta-row energy-balance-row">
+      <span class="meta-label">Your Energy</span>
+      <span class="meta-value muted-inline">Syncing…</span>
+    </div>`
+  }
+
+  if (status === 'error') {
+    return `<div class="meta-row energy-balance-row">
+      <span class="meta-label">Your Energy</span>
+      <span class="meta-value">
+        Could not sync
+        <button type="button" class="btn btn-ghost btn-inline-link" id="checkout-retry-energy-btn">Retry</button>
+      </span>
+    </div>`
+  }
+
+  if (status === 'expired') {
+    return `<div class="meta-row energy-balance-row">
+      <span class="meta-label">Your Energy</span>
+      <span class="meta-value">
+        Session expired
+        <button type="button" class="btn btn-ghost btn-inline-link" id="checkout-relink-account-btn">Re-link</button>
+      </span>
+    </div>`
+  }
+
+  // ready — only now may we show 0 if backend returned 0
+  const bal = Math.max(0, Math.floor(Number(session.energyBalance) || 0))
+  return `<div class="meta-row energy-balance-row">
+    <span class="meta-label">Your Energy</span>
+    <span class="meta-value">${formatEnergyPriceHtml(bal)}</span>
+  </div>`
+}
+
+function bindCheckoutEnergyBalanceActions() {
+  document.getElementById('checkout-link-account-btn')?.addEventListener('click', () => {
+    openLinkMoveplusAccountModal()
+  })
+  document.getElementById('checkout-relink-account-btn')?.addEventListener('click', () => {
+    openLinkMoveplusAccountModal()
+  })
+  document.getElementById('checkout-retry-energy-btn')?.addEventListener('click', () => {
+    void fetchMovePlusEnergyBalance({ force: true, silent: false }).then(() => {
+      if (state.view === 'checkout') {
+        captureCheckoutDeliveryState()
+        render()
+      }
+    })
+  })
 }
 
 async function invokeFunctionWithUserJwt(name, accessToken, body = {}) {
@@ -2789,8 +3730,23 @@ async function mintMarketplaceSessionFromAccessToken(accessToken) {
   }
   persistWebSession(data.session_token, data.expires_at)
   persistAccountSummary(data.account)
+  const seededBalance = Math.max(0, Math.floor(Number(data.account?.energy_balance) || 0))
+  state.movePlusSession = {
+    linked: true,
+    token: data.session_token,
+    energyBalance: Number.isFinite(Number(data.account?.energy_balance)) ? seededBalance : null,
+    balanceStatus: Number.isFinite(Number(data.account?.energy_balance)) ? 'ready' : 'loading',
+    balanceError: null,
+    updatedAt: new Date().toISOString(),
+    sessionExpiresAt: data.expires_at || null,
+  }
   syncAccountHeaderButton()
-  if (state.view === 'checkout') render()
+  // Fresh server balance immediately after link (do not wait for page refresh).
+  await fetchMovePlusEnergyBalance({ force: true, silent: true })
+  if (state.view === 'checkout') {
+    captureCheckoutDeliveryState({ collapseIfComplete: true })
+    render()
+  }
   return data.account
 }
 
@@ -2820,16 +3776,43 @@ async function refreshLinkedAccountSummary({ silent = false } = {}) {
     if (status >= 200 && status < 300 && data?.success && data.account) {
       if (data.expires_at) persistWebSession(session.session_token, data.expires_at)
       persistAccountSummary(data.account)
+      if (Number.isFinite(Number(data.account.energy_balance))) {
+        state.movePlusSession = {
+          ...state.movePlusSession,
+          linked: true,
+          token: session.session_token,
+          energyBalance: Math.max(0, Math.floor(Number(data.account.energy_balance))),
+          balanceStatus: 'ready',
+          balanceError: null,
+          updatedAt: new Date().toISOString(),
+          sessionExpiresAt: data.expires_at || session.expires_at || null,
+        }
+      }
       syncAccountHeaderButton()
-      if (state.view === 'checkout') render()
+      if (state.view === 'checkout') {
+        captureCheckoutDeliveryState({ collapseIfComplete: true })
+        render()
+      }
       if (!silent) showToast('Account refreshed.', null, null)
       return data.account
     }
     if (status === 401) {
       clearLinkedAccountLocal()
+      state.movePlusSession = {
+        linked: false,
+        token: null,
+        energyBalance: null,
+        balanceStatus: 'expired',
+        balanceError: 'Session expired',
+        updatedAt: null,
+        sessionExpiresAt: null,
+      }
       syncAccountHeaderButton()
       if (!silent) showToast('Session expired. Sign in again to link your Move+ account.', null, null)
-      if (state.view === 'checkout') render()
+      if (state.view === 'checkout') {
+        captureCheckoutDeliveryState()
+        render()
+      }
     } else if (!silent) {
       showToast((data && (data.error || data.message)) || 'Could not refresh account.', null, null)
     }
@@ -2853,7 +3836,10 @@ async function disconnectLinkedAccount() {
   syncAccountHeaderButton()
   closeModal()
   showToast('Move+ account disconnected on this browser.', null, null)
-  if (state.view === 'checkout') render()
+  if (state.view === 'checkout') {
+    captureCheckoutDeliveryState()
+    render()
+  }
 }
 
 function isMoveplusAccountLinked() {
@@ -2872,7 +3858,7 @@ function isMoveplusAccountLinked() {
  * Never stores email/phone/wallets in long-term localStorage.
  */
 function getLinkedAccountSummary() {
-  const linked = isMoveplusAccountLinked()
+  const linked = Boolean(state.movePlusSession?.linked) || isMoveplusAccountLinked()
   if (!linked) {
     return {
       linked: false,
@@ -2892,8 +3878,21 @@ function getLinkedAccountSummary() {
   let baseGearCount = null
   let primaryGearLabel = null
 
+  // Prefer hydrated checkout session balance (authoritative sync path).
+  if (
+    state.movePlusSession?.balanceStatus === 'ready' &&
+    state.movePlusSession.energyBalance != null
+  ) {
+    energyBalance = Math.max(0, Math.floor(Number(state.movePlusSession.energyBalance)))
+  }
+
   const cfgBalance = cfg().moveplusEnergyBalance
-  if (cfgBalance != null && cfgBalance !== '' && Number.isFinite(Number(cfgBalance))) {
+  if (
+    energyBalance == null &&
+    cfgBalance != null &&
+    cfgBalance !== '' &&
+    Number.isFinite(Number(cfgBalance))
+  ) {
     energyBalance = Math.max(0, Math.floor(Number(cfgBalance)))
   }
   if (typeof cfg().moveplusDisplayName === 'string' && cfg().moveplusDisplayName.trim()) {
@@ -2905,7 +3904,7 @@ function getLinkedAccountSummary() {
     if (raw) {
       const parsed = JSON.parse(raw)
       if (parsed && typeof parsed === 'object') {
-        if (Number.isFinite(Number(parsed.energy_balance))) {
+        if (energyBalance == null && Number.isFinite(Number(parsed.energy_balance))) {
           energyBalance = Math.max(0, Math.floor(Number(parsed.energy_balance)))
         }
         if (typeof parsed.display_label === 'string' && parsed.display_label.trim()) {
@@ -2953,8 +3952,8 @@ function isEmailOtpLoginEnabled() {
 function accountWalletIconSvg() {
   return `
     <svg class="header-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <path d="" stroke="currentColor" stroke-width="1.6" />
-      <path d="" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" />
+      <path d="M4 8.5A2.5 2.5 0 016.5 6h11A2.5 2.5 0 0120 8.5v7a2.5 2.5 0 01-2.5 2.5h-11A2.5 2.5 0 014 15.5v-7z" stroke="currentColor" stroke-width="1.6" />
+      <path d="M16 12h4.5v2.5H16A1.25 1.25 0 0116 12z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" />
       <path d="M8 10.5v3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
     </svg>
   `.trim()
@@ -3260,25 +4259,25 @@ function openLinkMoveplusAccountModal() {
 
 function openEnergyComingSoonModal() {
   openModal({
-    title: 'Pay with ENERGY',
+    title: 'Energy discount',
     bodyElement: buildAccountModalBody(
-      'Energy checkout on web is coming soon. You can redeem Energy inside the Move+ app.',
-      ['MiniPay USDT / USDC / cUSD checkout is available now for Real Items.'],
+      'Full Energy payment is disabled for Real Items. Use Apply Energy Discount, then pay the remaining balance with MiniPay.',
+      ['Default max discount is 20% (10 Energy = ₱1).'],
     ),
-    primaryLabel: 'OK',
-    primaryAction: closeModal,
-    secondaryLabel: null,
-    secondaryAction: null,
+    primaryLabel: 'Apply Energy Discount',
+    primaryAction: () => openApplyEnergyDiscountModal(previewEnergyDiscount(state.requestedEnergyDiscount || 0)),
+    secondaryLabel: 'Not now',
+    secondaryAction: closeModal,
   })
 }
 
 function openInsufficientEnergyModal(balance, required) {
   openModal({
     title: 'Insufficient Energy',
-    bodyElement: buildAccountModalBody('Insufficient Energy balance.', [
+    bodyElement: buildAccountModalBody('Not enough Energy for that discount.', [
       `Your balance: ${formatEnergyBalanceLabel(balance)} ENERGY`,
-      `Cart total: ${formatEnergyBalanceLabel(required)} ENERGY`,
-      'Earn more Energy in the Move+ app, or pay with MiniPay (USDT / USDC / cUSD).',
+      `Requested: ${formatEnergyBalanceLabel(required)} ENERGY`,
+      'Lower the discount or pay more with MiniPay (cUSD / USDT / USDC).',
     ]),
     primaryLabel: 'OK',
     primaryAction: closeModal,
@@ -3287,24 +4286,8 @@ function openInsufficientEnergyModal(balance, required) {
   })
 }
 
-function handleEnergyPayClick(requiredEnergy) {
-  const summary = getLinkedAccountSummary()
-
-  if (!summary.linked) {
-    openLinkMoveplusAccountModal()
-    return
-  }
-
-  const required = Math.max(0, Math.floor(Number(requiredEnergy) || 0))
-  const balance = summary.energyBalance
-
-  if (balance != null && Number.isFinite(balance) && balance < required) {
-    openInsufficientEnergyModal(balance, required)
-    return
-  }
-
-  // V1: no web Energy deduction — backend checkout not enabled yet.
-  openEnergyComingSoonModal()
+function handleEnergyPayClick(_requiredEnergy) {
+  openApplyEnergyDiscountModal(previewEnergyDiscount(state.requestedEnergyDiscount || 0))
 }
 
 function closeAllHeaderOverlays() {
