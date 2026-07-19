@@ -1,4 +1,4 @@
-# Move+ — Network Manifest (Web Marketplace)
+# Move+ Network Manifest (Web Marketplace)
 
 Public URLs and origins used by the **Move+ Web Marketplace** MiniPay submission. **No secrets** — service role keys, owner private keys, and other privileged credentials are server-side only.
 
@@ -25,8 +25,8 @@ Canonical copy also lives at `web/marketplace/NETWORK_MANIFEST.md`.
 
 Edge functions used by MiniPay checkout (public names only):
 
-- `minipay-checkout-create-session`
-- `minipay-checkout-verify-payment`
+- `minipay-checkout-create-session` (calculates Energy discount + remaining stablecoin server-side)
+- `minipay-checkout-verify-payment` (verifies tx; deducts Energy discount after paid)
 - `minipay-checkout-session-status`
 
 Edge functions used by Move+ account linking (public names only):
@@ -50,7 +50,7 @@ The browser uses the **Supabase anon key** only. The **service role key is never
 | Chain ID | `42220` |
 | RPC (server / verification) | `https://forno.celo.org` |
 | Block explorer (tx links) | `https://celoscan.io/tx/` |
-| Checkout currencies | USDT, USDC, cUSD (CELO is **not** used as checkout currency) |
+| Checkout currencies | cUSD (default), USDT, USDC (CELO is **not** used as checkout currency) |
 | USDT | `0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e` (6 decimals) |
 | USDC | `0xcebA9300f2b948710d2653dD7B07f33A8B32118C` (6 decimals) |
 | cUSD | `0x765DE816845861e75A25fCA122bb6898B8B1282a` (18 decimals) |
