@@ -176,13 +176,16 @@ Add `debug=1` to URL (`&debug=1` if query params exist). Shows provider status w
 
 ## Energy payments
 
-Web can **link** a Move+ account directly inside the MiniPay Mini App / marketplace via Supabase Auth (**Email / Password**).
+Real Items use **Energy as a discount only** (default max 20%), then MiniPay pays the remaining cUSD/USDT/USDC.
 
-**Email code (OTP)** is disabled by default (`enableEmailOtpLogin: false`). Enable only after the Supabase Auth email template includes a visible numeric token (`{{ .Token }}`). Do not rely on magic-link-only emails inside MiniPay — links may open outside the webview.
+Economy preview: **10 Energy = ₱1** (`energy_php_value = 0.10`). Admin sets `php_per_cusd` (e.g. 56) to convert PHP discount into remaining stablecoin.
 
-Web **does not deduct Energy** in v1. Pay with ENERGY shows “coming soon” when linked with sufficient balance. Native `createPurchase()` remains the Energy spend path inside the Move+ app.
+- Link Move+ account to apply Energy discount (marketplace session token).
+- Backend recalculates discount; client totals are never trusted.
+- Full Energy payment stays off unless admin enables it globally/per product.
+- Energy is deducted server-side only after MiniPay payment verifies.
 
-MiniPay USDT / USDC / cUSD checkout is unchanged and works without linking.
+Native in-app Energy `createPurchase()` is unchanged.
 
 ## Related folders
 
