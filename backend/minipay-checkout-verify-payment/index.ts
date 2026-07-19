@@ -3,19 +3,21 @@
  * Status-only query when tx_hash omitted (Check Payment Status).
  */
 
-import { serve } from 'https://'
-import { createClient } from 'https://'
+import { serve } from 'https://deno.land/std@0.168.0/http/server.ts'
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 import {
   fetchTransactionReceipt,
   findErc20TransferToTreasury,
   loadMinipayCeloConfig,
   normalizeEvmAddress,
+  resolveMinipayToken,
   sha256Hex,
 } from './minipay_celo.ts'
 import {
   getMarketplacePaymentsContractAddress,
   hashMarketplaceOrderId,
   isMarketplaceOrderPaidOnChain,
+  isMarketplaceTokenAllowedOnChain,
   loadMarketplacePaymentsSignerConfig,
   recordMarketplacePaymentReceipt,
 } from './marketplace_payments_contract.ts'
@@ -25,6 +27,11 @@ import {
   RATE_LIMIT_ERROR,
   readClientIpForRateLimit,
 } from './rate_limit.ts'
+import { isOfferExpiredRow, OFFER_EXPIRED_ERROR } from './marketplace_offer.ts'
+import {
+  mapEnergyDiscountStatusForClient,
+  parseEnergyReservationRpc,
+} from './energy_reservation.ts'
 
 const corsHeaders: Record<string, string> = {
   'Access-Control-Allow-Origin': '*',
@@ -70,6 +77,15 @@ type SessionRow = {
   cart_items: Array<Record<string, unknown>> | null
   total_quantity: number | null
   energy_points_total: number | null
+  energy_discount_energy?: number | null
+  energy_discount_php?: number | null
+  energy_discount_crypto?: number | null
+  energy_discount_applied_at?: string | null
+  energy_discount_status?: string | null
+  energy_discount_reservation_id?: string | null
+  energy_discount_redeemed_at?: string | null
+  energy_discount_released_at?: string | null
+  fulfillment_review_required?: boolean | null
   receipt_contract_address: string | null
   receipt_tx_hash: string | null
   receipt_recorded_at: string | null
@@ -173,12 +189,20 @@ function paidPayload(
     receipt_pending?: boolean
     receipt_explorer_url?: string | null
   },
+  extras?: {
+    fulfillment_review_required?: boolean
+    energy_settle_warning?: string | null
+  },
 ) {
   const receiptExplorer =
     receiptMeta?.receipt_explorer_url ??
     (session.receipt_tx_hash && celoExplorerBase
       ? `${celoExplorerBase}${session.receipt_tx_hash}`
       : null)
+
+  const reviewRequired =
+    extras?.fulfillment_review_required === true ||
+    session.fulfillment_review_required === true
 
   return {
     success: true,
@@ -191,7 +215,7 @@ function paidPayload(
     payer_wallet_address: session.payer_wallet_address,
     item_title: itemTitle,
     purchase_id: purchaseId,
-    order_status: 'pending',
+    order_status: reviewRequired ? 'fulfillment_review' : 'pending',
     delivery_region: 'Philippines only',
     receipt_contract_address: session.receipt_contract_address ?? null,
     receipt_tx_hash: session.receipt_tx_hash ?? null,
@@ -201,6 +225,90 @@ function paidPayload(
     receipt_pending: receiptMeta?.receipt_pending === true ||
       (session.receipt_pending === true && !session.receipt_tx_hash),
     receipt_explorer_url: receiptExplorer,
+    energy_discount_status: mapEnergyDiscountStatusForClient(session),
+    energy_discount_energy: Math.max(
+      0,
+      Math.floor(Number(session.energy_discount_energy ?? 0) || 0),
+    ),
+    fulfillment_review_required: reviewRequired,
+    warning: extras?.energy_settle_warning ??
+      (reviewRequired
+        ? 'Payment verified but Energy discount needs admin review before fulfillment.'
+        : null),
+  }
+}
+
+async function settleEnergyDiscount(
+  admin: ReturnType<typeof createClient>,
+  sessionId: string,
+  txHash: string | null,
+): Promise<{ ok: boolean; reviewRequired: boolean; status?: string; errorCode?: string }> {
+  const { data, error } = await admin.rpc('settle_minipay_energy_discount', {
+    p_session_id: sessionId,
+    p_tx_hash: txHash,
+  })
+  const parsed = parseEnergyReservationRpc(data)
+  if (error) {
+    safeError('minipay_energy_settle_rpc_failed', { message: error.message })
+    await admin
+      .from('marketplace_minipay_sessions')
+      .update({
+        fulfillment_review_required: true,
+        energy_discount_status: 'failed',
+      })
+      .eq('id', sessionId)
+    return { ok: false, reviewRequired: true, errorCode: 'rpc_error' }
+  }
+  if (!parsed.ok) {
+    safeError('minipay_energy_settle_failed', {
+      session_prefix: sessionId.slice(0, 8),
+      code: parsed.error_code,
+      status: parsed.status,
+    })
+    await admin
+      .from('marketplace_minipay_sessions')
+      .update({
+        fulfillment_review_required: true,
+        energy_discount_status: 'failed',
+      })
+      .eq('id', sessionId)
+    return {
+      ok: false,
+      reviewRequired: true,
+      status: parsed.status,
+      errorCode: parsed.error_code,
+    }
+  }
+  return {
+    ok: true,
+    reviewRequired: false,
+    status: parsed.status,
+  }
+}
+
+async function releaseEnergyDiscount(
+  admin: ReturnType<typeof createClient>,
+  sessionId: string,
+  reason: string,
+) {
+  const { data, error } = await admin.rpc('release_minipay_energy_discount', {
+    p_session_id: sessionId,
+    p_reason: reason,
+  })
+  if (error) {
+    safeError('minipay_energy_release_rpc_failed', {
+      message: error.message,
+      reason,
+    })
+    return
+  }
+  const parsed = parseEnergyReservationRpc(data)
+  if (!parsed.ok) {
+    safeError('minipay_energy_release_failed', {
+      session_prefix: sessionId.slice(0, 8),
+      code: parsed.error_code,
+      reason,
+    })
   }
 }
 
@@ -266,18 +374,33 @@ async function prepareReceiptMetadata(
   const contractAddress = getMarketplacePaymentsContractAddress()
   const orderIdHash = session.receipt_order_hash ?? hashMarketplaceOrderId(session.id)
 
-  let receiptPending = true
-  let receiptTxHash: string | null = null
-  let receiptRecordedAt: string | undefined
+  const receiptRecord: {
+    pending: boolean
+    txHash: string | null
+    recordedAt: string | undefined
+  } = {
+    pending: true,
+    txHash: null,
+    recordedAt: undefined,
+  }
 
   const alreadyPaidOnChain = await isMarketplaceOrderPaidOnChain(session.id)
   if (alreadyPaidOnChain) {
-    receiptPending = false
+    receiptRecord.pending = false
+  }
+
+  const tokenAllowedOnChain = await isMarketplaceTokenAllowedOnChain(session.token_address)
+  if (tokenAllowedOnChain === false) {
+    safeLog('marketplace_payments_token_not_allowed_on_chain', {
+      session_prefix: session.id.slice(0, 8),
+      token: session.token_address.slice(0, 10),
+    })
+    receiptRecord.pending = true
   }
 
   const signerConfig = loadMarketplacePaymentsSignerConfig()
-  if (signerConfig && !alreadyPaidOnChain) {
-    const result = await recordMarketplacePaymentReceipt({
+  if (signerConfig && !alreadyPaidOnChain && tokenAllowedOnChain !== false) {
+    const contractCallResult = await recordMarketplacePaymentReceipt({
       sessionId: session.id,
       payerAddress: payerWallet,
       tokenAddress: session.token_address,
@@ -285,19 +408,19 @@ async function prepareReceiptMetadata(
       paymentTxHash,
     })
 
-    if (result.recorded || result.alreadyPaidOnChain) {
-      receiptPending = false
-      receiptTxHash = result.receiptTxHash
-      receiptRecordedAt = new Date().toISOString()
+    if (contractCallResult.recorded || contractCallResult.alreadyPaidOnChain) {
+      receiptRecord.pending = false
+      receiptRecord.txHash = contractCallResult.receiptTxHash
+      receiptRecord.recordedAt = new Date().toISOString()
     }
   }
 
   await persistReceiptFields(admin, session.id, {
     receipt_contract_address: contractAddress,
     receipt_order_hash: orderIdHash,
-    receipt_tx_hash: receiptTxHash,
-    receipt_recorded_at: receiptRecordedAt,
-    receipt_pending: receiptPending,
+    receipt_tx_hash: receiptRecord.txHash,
+    receipt_recorded_at: receiptRecord.recordedAt,
+    receipt_pending: receiptRecord.pending,
   })
 
   const refreshed = await loadSession(admin, session.id)
@@ -305,14 +428,14 @@ async function prepareReceiptMetadata(
     ...session,
     receipt_contract_address: contractAddress,
     receipt_order_hash: orderIdHash,
-    receipt_tx_hash: receiptTxHash,
-    receipt_recorded_at: receiptRecordedAt ?? null,
-    receipt_pending: receiptPending,
+    receipt_tx_hash: receiptRecord.txHash,
+    receipt_recorded_at: receiptRecord.recordedAt ?? null,
+    receipt_pending: receiptRecord.pending,
   }
 
   return {
     session: merged,
-    receiptPending: receiptPending && !merged.receipt_tx_hash,
+    receiptPending: receiptRecord.pending && !merged.receipt_tx_hash,
   }
 }
 
@@ -375,7 +498,7 @@ serve(async (req) => {
 
     const { data: item } = await admin
       .from('marketplace_items')
-      .select('id, title, is_available, is_deleted')
+      .select('id, title, is_available, is_deleted, is_limited_offer, offer_ends_at')
       .eq('id', session.marketplace_item_id)
       .maybeSingle()
 
@@ -390,6 +513,34 @@ serve(async (req) => {
         }, 409)
       }
 
+      // Retry settle if paid but reservation still reserved / review required.
+      const energyStatus = String(session.energy_discount_status ?? 'none')
+      const needsSettleRetry =
+        Math.max(0, Math.floor(Number(session.energy_discount_energy ?? 0) || 0)) > 0 &&
+        energyStatus !== 'redeemed' &&
+        !session.energy_discount_applied_at
+
+      let workingPaid = session
+      let reviewRequired = session.fulfillment_review_required === true
+      let energyWarning: string | null = null
+
+      if (needsSettleRetry) {
+        const settle = await settleEnergyDiscount(
+          admin,
+          sessionId,
+          session.tx_hash ?? txHashRaw,
+        )
+        const refreshed = await loadSession(admin, sessionId)
+        if (refreshed) workingPaid = refreshed
+        if (!settle.ok) {
+          reviewRequired = true
+          energyWarning =
+            'Payment verified but Energy discount settlement needs admin review. Order will not auto-fulfill.'
+        } else {
+          reviewRequired = workingPaid.fulfillment_review_required === true
+        }
+      }
+
       let celoConfigForReceipt
       try {
         celoConfigForReceipt = loadMinipayCeloConfig()
@@ -397,28 +548,33 @@ serve(async (req) => {
         celoConfigForReceipt = null
       }
 
-      const paidTx = session.tx_hash ?? txHashRaw
-      const paidPayer = session.payer_wallet_address ?? payerWallet
-      const receipt = paidTx && paidPayer
-        ? await prepareReceiptMetadata(
-          admin,
-          session,
-          paidTx,
-          paidPayer,
-          BigInt(session.crypto_amount_raw),
-        )
-        : {
-          session,
-          receiptPending: session.receipt_pending === true || !session.receipt_tx_hash,
-        }
+      const paidTx = workingPaid.tx_hash ?? txHashRaw
+      const paidPayer = workingPaid.payer_wallet_address ?? payerWallet
+      const existingPaymentReceipt =
+        !reviewRequired && paidTx && paidPayer
+          ? await prepareReceiptMetadata(
+            admin,
+            workingPaid,
+            paidTx,
+            paidPayer,
+            BigInt(workingPaid.crypto_amount_raw),
+          )
+          : {
+            session: workingPaid,
+            receiptPending: true,
+          }
 
       return json(
         paidPayload(
-          receipt.session,
+          existingPaymentReceipt.session,
           itemTitle,
-          session.purchase_id,
+          workingPaid.purchase_id,
           celoConfigForReceipt?.explorerBaseUrl,
-          { receipt_pending: receipt.receiptPending },
+          { receipt_pending: existingPaymentReceipt.receiptPending },
+          {
+            fulfillment_review_required: reviewRequired,
+            energy_settle_warning: energyWarning,
+          },
         ),
         200,
       )
@@ -431,6 +587,7 @@ serve(async (req) => {
           .update({ status: 'expired' })
           .eq('id', sessionId)
       }
+      await releaseEnergyDiscount(admin, sessionId, 'session_expired')
       return json({ success: false, error: 'Session expired', status: 'expired' }, 410)
     }
 
@@ -483,8 +640,23 @@ serve(async (req) => {
       return json({ success: false, error: 'Chain mismatch' }, 400)
     }
 
-    const receipt = await fetchTransactionReceipt(celoConfig.rpcUrl, txHashRaw)
-    if (!receipt) {
+    // Harden: session token must match server registry (never trust client-supplied address).
+    const registryToken = resolveMinipayToken(session.token_symbol)
+    if (
+      !registryToken ||
+      normalizeEvmAddress(session.token_address) !==
+        normalizeEvmAddress(registryToken.address) ||
+      Number(session.token_decimals) !== Number(registryToken.decimals)
+    ) {
+      safeError('minipay_verify_token_registry_mismatch', {
+        session_prefix: sessionId.slice(0, 8),
+        symbol: session.token_symbol,
+      })
+      return json({ success: false, error: 'Unsupported payment token on session' }, 400)
+    }
+
+    const txReceipt = await fetchTransactionReceipt(celoConfig.rpcUrl, txHashRaw)
+    if (!txReceipt) {
       return json({
         success: false,
         error: 'Transaction not found yet',
@@ -492,17 +664,18 @@ serve(async (req) => {
       }, 202)
     }
 
-    if (receipt.status !== '0x1') {
+    if (txReceipt.status !== '0x1') {
       await admin
         .from('marketplace_minipay_sessions')
         .update({ status: 'failed', tx_hash: txHashRaw, payer_wallet_address: payerWallet })
         .eq('id', sessionId)
+      await releaseEnergyDiscount(admin, sessionId, 'payment_failed_on_chain')
       return json({ success: false, error: 'Transaction failed on-chain', status: 'failed' }, 400)
     }
 
     const expectedRaw = BigInt(session.crypto_amount_raw)
     const transfer = findErc20TransferToTreasury(
-      receipt,
+      txReceipt,
       session.token_address,
       session.treasury_address,
       payerWallet,
@@ -528,11 +701,15 @@ serve(async (req) => {
       return json({ success: false, error: 'Product no longer available' }, 400)
     }
 
+    if (item && isOfferExpiredRow(item)) {
+      return json({ success: false, error: OFFER_EXPIRED_ERROR }, 400)
+    }
+
     const cartLines = readCartItems(session)
     for (const line of cartLines) {
       const { data: lineItem } = await admin
         .from('marketplace_items')
-        .select('id, title, is_available, is_deleted, stock_quantity')
+        .select('id, title, is_available, is_deleted, stock_quantity, is_limited_offer, offer_ends_at')
         .eq('id', line.marketplace_item_id)
         .maybeSingle()
 
@@ -541,6 +718,10 @@ serve(async (req) => {
           success: false,
           error: `Product no longer available: ${line.product_title_snapshot}`,
         }, 400)
+      }
+
+      if (isOfferExpiredRow(lineItem)) {
+        return json({ success: false, error: OFFER_EXPIRED_ERROR }, 400)
       }
 
       const stockRaw = lineItem.stock_quantity
@@ -607,10 +788,29 @@ serve(async (req) => {
     }
 
     let purchaseId = workingSession.purchase_id
+    let energySettleWarning: string | null = null
+    let fulfillmentReviewRequired = workingSession.fulfillment_review_required === true
+
+    // Redeem reserved Energy after paid claim (idempotent). Never deduct again here.
+    {
+      const settle = await settleEnergyDiscount(admin, sessionId, txHashRaw)
+      if (!settle.ok) {
+        fulfillmentReviewRequired = true
+        energySettleWarning =
+          'Payment verified but Energy discount settlement needs admin review. Order will not auto-fulfill.'
+      } else {
+        const refreshedAfterSettle = await loadSession(admin, sessionId)
+        if (refreshedAfterSettle) {
+          workingSession = refreshedAfterSettle
+          fulfillmentReviewRequired =
+            refreshedAfterSettle.fulfillment_review_required === true
+        }
+      }
+    }
 
     if (!purchaseId) {
-      const energyPaid = session.energy_points_total != null
-        ? Math.max(0, Math.floor(Number(session.energy_points_total)))
+      const energyDiscountPaid = workingSession.energy_discount_energy != null
+        ? Math.max(0, Math.floor(Number(workingSession.energy_discount_energy)))
         : 0
 
       const { data: purchase, error: purchaseErr } = await admin
@@ -618,14 +818,19 @@ serve(async (req) => {
         .insert({
           user_id: workingSession.user_id,
           marketplace_item_id: workingSession.marketplace_item_id,
-          energy_points_paid: energyPaid,
+          energy_points_paid: energyDiscountPaid,
           status: 'pending',
           customer_name: workingSession.customer_name,
           phone_number: workingSession.phone_number,
           email: workingSession.email,
           delivery_address: workingSession.delivery_address,
-          comments: workingSession.comments,
-          payment_method: 'minipay',
+          comments: fulfillmentReviewRequired
+            ? [
+              workingSession.comments,
+              '[fulfillment_review_required] Energy discount settle failed — verify Energy ledger before shipping.',
+            ].filter(Boolean).join('\n')
+            : workingSession.comments,
+          payment_method: energyDiscountPaid > 0 ? 'minipay_energy_discount' : 'minipay',
           payment_status: 'paid',
           chain: 'celo',
           tx_hash: txHashRaw,
@@ -667,20 +872,34 @@ serve(async (req) => {
         purchaseId = purchase.id
       }
 
-      if (purchaseId) {
+      // Do not enqueue automatic fulfillment when Energy settle needs review.
+      if (purchaseId && !fulfillmentReviewRequired) {
         await insertOrderItems(admin, purchaseId, workingSession, itemTitle)
+      } else if (purchaseId && fulfillmentReviewRequired) {
+        safeLog('minipay_fulfillment_held_for_energy_review', {
+          session_id: sessionId,
+          purchase_id: purchaseId,
+        })
       }
 
       if (!workingSession.purchase_id && purchaseId) {
         const { error: linkErr } = await admin
           .from('marketplace_minipay_sessions')
-          .update({ purchase_id: purchaseId })
+          .update({
+            purchase_id: purchaseId,
+            fulfillment_review_required: fulfillmentReviewRequired,
+          })
           .eq('id', sessionId)
 
         if (linkErr) {
           safeError('minipay_session_purchase_link_failed', { message: linkErr.message })
         }
       }
+    } else if (fulfillmentReviewRequired) {
+      await admin
+        .from('marketplace_minipay_sessions')
+        .update({ fulfillment_review_required: true })
+        .eq('id', sessionId)
     }
 
     safeLog('minipay_checkout_paid', {
@@ -688,6 +907,7 @@ serve(async (req) => {
       purchase_id: purchaseId,
       payer: shortAddress(payerWallet),
       tx_prefix: txHashRaw.slice(0, 10),
+      fulfillment_review_required: fulfillmentReviewRequired,
     })
 
     const paidSession: SessionRow = {
@@ -696,9 +916,28 @@ serve(async (req) => {
       payer_wallet_address: payerWallet,
       status: 'paid',
       purchase_id: purchaseId,
+      fulfillment_review_required: fulfillmentReviewRequired,
     }
 
-    const receipt = await prepareReceiptMetadata(
+    // Hold receipt/on-chain fulfillment helpers when Energy review is required.
+    if (fulfillmentReviewRequired) {
+      return json({
+        ...paidPayload(
+          paidSession,
+          itemTitle,
+          purchaseId,
+          celoConfig.explorerBaseUrl,
+          { receipt_pending: true },
+          {
+            fulfillment_review_required: true,
+            energy_settle_warning: energySettleWarning,
+          },
+        ),
+        explorer_url: `${celoConfig.explorerBaseUrl}${txHashRaw}`,
+      }, 200)
+    }
+
+    const receiptResult = await prepareReceiptMetadata(
       admin,
       paidSession,
       txHashRaw,
@@ -708,11 +947,15 @@ serve(async (req) => {
 
     return json({
       ...paidPayload(
-        receipt.session,
+        receiptResult.session,
         itemTitle,
         purchaseId,
         celoConfig.explorerBaseUrl,
-        { receipt_pending: receipt.receiptPending },
+        { receipt_pending: receiptResult.receiptPending },
+        {
+          fulfillment_review_required: false,
+          energy_settle_warning: null,
+        },
       ),
       explorer_url: `${celoConfig.explorerBaseUrl}${txHashRaw}`,
     }, 200)
