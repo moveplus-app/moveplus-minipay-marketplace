@@ -557,8 +557,37 @@ function encodeErc20Transfer(to, amountRaw) {
   if (!toNorm) throw new Error('Invalid treasury address')
   const toPadded = toNorm.slice(2).padStart(64, '0')
   const amount = BigInt(amountRaw)
+  if (amount <= 0n) throw new Error('Invalid transfer amount')
   const amountHex = amount.toString(16).padStart(64, '0')
   return `${ERC20_TRANSFER_SELECTOR}${toPadded}${amountHex}`
+}
+
+/**
+ * Build MiniPay eth_sendTransaction params for an ERC-20 stablecoin payment.
+ * MUST send to the token contract with transfer(treasury, amount) calldata — never native CELO to treasury.
+ */
+function buildErc20PaymentTx({ payerWallet, tokenAddress, treasuryAddress, amountRaw }) {
+  const from = normalizeAddr(payerWallet)
+  const token = normalizeAddr(tokenAddress)
+  const treasury = normalizeAddr(treasuryAddress)
+  if (!from) throw new Error('Invalid payer wallet')
+  if (!token) throw new Error('Invalid token contract address')
+  if (!treasury) throw new Error('Invalid treasury address')
+  if (token === treasury) {
+    throw new Error('Payment config error: token address must not equal treasury')
+  }
+
+  const data = encodeErc20Transfer(treasury, amountRaw)
+  if (!data.startsWith(ERC20_TRANSFER_SELECTOR) || data.length !== 2 + 8 + 64 + 64) {
+    throw new Error('Failed to encode ERC20 transfer calldata')
+  }
+
+  return {
+    from,
+    to: token,
+    data,
+    value: '0x0',
+  }
 }
 
 function encodeErc20BalanceOf(owner) {
@@ -608,6 +637,9 @@ function friendlyPaymentError(err, tokenSymbol) {
   if (isInsufficientBalanceError(err)) return insufficientTokenMessage(tokenSymbol || getSelectedPaymentToken().symbol)
 
   const raw = String(err?.message ?? err ?? 'Payment failed')
+  if (/Valid ERC20 transfer not found/i.test(raw)) {
+    return 'Payment transaction was submitted, but no stablecoin transfer was found. Please contact support.'
+  }
   // Hide JSON-RPC / eth_estimateGas noise from normal users
   const looksRawRpc =
     raw.includes('eth_estimateGas') ||
@@ -620,10 +652,6 @@ function friendlyPaymentError(err, tokenSymbol) {
     return 'Payment could not be completed. Please try again or choose another token.'
   }
   return raw
-}
-
-function chainIdHex(chainId) {
-  return `0x${Number(chainId).toString(16)}`
 }
 
 function resolveImageUrl(url) {
@@ -1293,6 +1321,12 @@ function friendlyFetchError(err) {
 
 function friendlyApiError(status, data) {
   if (data?.error && typeof data.error === 'string') {
+    if (
+      data.error_code === 'erc20_transfer_not_found' ||
+      /Valid ERC20 transfer not found/i.test(data.error)
+    ) {
+      return 'Payment transaction was submitted, but no stablecoin transfer was found. Please contact support.'
+    }
     if (
       data.error_code === 'insufficient_balance' ||
       /energy balance changed/i.test(data.error)
@@ -3049,23 +3083,51 @@ async function confirmMinipayPayment(session) {
     if (liveStatus) liveStatus.textContent = 'awaiting confirmation'
     payBtn.textContent = 'Confirm in MiniPay…'
 
-    const dataHex = encodeErc20Transfer(session.treasuryAddress, session.amountRaw)
-    const txParams = {
-      from: payer,
-      to: session.tokenAddress,
-      data: dataHex,
-      value: '0x0',
-      chainId: chainIdHex(session.chainId),
-    }
-    logDebug('eth_sendTransaction params', {
-      to: txParams.to,
-      from: txParams.from,
-      chainId: txParams.chainId,
-      amountRaw: String(session.amountRaw),
-      tokenSymbol,
-      dataPrefix: dataHex.slice(0, 10),
+    const tokenAddress = normalizeAddr(session.tokenAddress)
+    const treasuryAddress = normalizeAddr(session.treasuryAddress)
+    const rawAmount = String(session.amountRaw)
+    const txParams = buildErc20PaymentTx({
+      payerWallet: payer,
+      tokenAddress,
+      treasuryAddress,
+      amountRaw: rawAmount,
     })
-    setPaymentDebug({ step: 'eth_sendTransaction-started', lastError: null })
+
+    // Guard: never allow a native CELO send to treasury for stablecoin checkout.
+    if (txParams.to === treasuryAddress || txParams.value !== '0x0') {
+      throw new Error('Refusing unsafe payment transaction shape')
+    }
+    if (!String(txParams.data || '').startsWith(ERC20_TRANSFER_SELECTOR)) {
+      throw new Error('ERC20 transfer calldata missing transfer selector')
+    }
+
+    console.log('[Move+ MiniPay] ERC20 payment tx', {
+      tokenAddress,
+      treasuryAddress,
+      rawAmount,
+      txTo: txParams.to,
+      txValue: txParams.value,
+      dataStartsWithTransferSelector: String(txParams.data).startsWith(ERC20_TRANSFER_SELECTOR),
+      dataPrefix: String(txParams.data).slice(0, 10),
+    })
+    logDebug('eth_sendTransaction params', {
+      tokenAddress,
+      treasuryAddress,
+      rawAmount,
+      to: txParams.to,
+      value: txParams.value,
+      from: txParams.from,
+      dataStartsWith0xa9059cbb: String(txParams.data).startsWith(ERC20_TRANSFER_SELECTOR),
+      dataPrefix: String(txParams.data).slice(0, 10),
+      tokenSymbol,
+    })
+    setPaymentDebug({
+      step: 'eth_sendTransaction-started',
+      lastError: null,
+      tokenAddress,
+      treasuryAddress,
+      amountRaw: rawAmount,
+    })
 
     const txHash = await window.ethereum.request({
       method: 'eth_sendTransaction',
