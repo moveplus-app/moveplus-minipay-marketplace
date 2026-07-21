@@ -3,8 +3,8 @@
  * Status-only query when tx_hash omitted (Check Payment Status).
  */
 
-import { serve } from 'https://deno.land/std@0.168.0/http/server.ts'
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
+import { serve } from 'https://'
+import { createClient } from 'https://'
 import {
   fetchTransactionReceipt,
   findErc20TransferToTreasury,
@@ -685,6 +685,7 @@ serve(async (req) => {
       return json({
         success: false,
         error: 'Valid ERC20 transfer not found',
+        error_code: 'erc20_transfer_not_found',
         status: 'failed',
       }, 400)
     }
