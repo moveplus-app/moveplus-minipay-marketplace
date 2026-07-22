@@ -9,14 +9,14 @@
   const GENESIS_FIRST = 1
   const GENESIS_LAST = 100
   const DESIGNS = ['design_a', 'design_b', 'design_c', 'design_d', 'design_e']
-  const GENESIS_CONTRACT = ''
+  const GENESIS_CONTRACT = '0x5f15397cc50df308731d94abb54f9f2e9b240733'
   const LOCAL_BASE = './assets/genesi_nft_shoes/genesis'
   const PLACEHOLDER = './assets/gear/gear_placeholder.png'
   const DEFAULT_IPFS_CID =
-    ''
+    'bafybeie3hiqwur425z45opp25tidmxolzeyq57owgg3m5lchvnkrxi7toq'
   const GATEWAYS = [
-    'https://gateway./',
-    'https://cloudflare/',
+    'https://gateway.lighthouse.storage/ipfs/',
+    'https://cloudflare-ipfs.com/ipfs/',
     'https://ipfs.io/ipfs/',
   ]
 

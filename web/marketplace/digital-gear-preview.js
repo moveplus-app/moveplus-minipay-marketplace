@@ -1,84 +1,43 @@
 /**
- * Public display only. Not inventory source.
- * Digital Gear preview cards for Move+ Web Marketplace.
- * Purchase/signing remains in the Move+ native app (Ronin/Base flows).
+ * Digital Gear preview entry for MiniPay Web Marketplace.
+ * Display-only collections:
+ *   - Ronin Genesis #1–#100 (digital-gear-genesis.js)
+ *   - Base Founder Gear #1–#100 (digital-gear-base.js)
+ *
+ * Season 1 / Shoebox are not included. No purchase/signing in MiniPay.
  */
-window.MOVEPLUS_DIGITAL_GEAR_PREVIEW = [
-  {
-    id: 'ronin-genesis-preview',
-    title: 'Genesis MoveShoe',
-    description: 'Limited Ronin genesis gear with awaken progression inside Move+.',
-    chain: 'Ronin',
-    gearType: 'Runner',
-    category: 'Ronin',
-    filterChain: 'Ronin',
-    filterType: 'Runner',
-    rarity: 'Genesis',
-    dailyCap: 'Varies by level',
-    multiplier: 'Gear bonus in-app',
-    repairDiscount: 'In-app repair',
-    imageUrl:
-      'https://',
-  },
-  {
-    id: 'ronin-season-preview',
-    title: 'Season MoveShoe',
-    description: 'Ronin season runner gear. Level, durability, and rarity sync in Move+.',
-    chain: 'Ronin',
-    gearType: 'Runner',
-    category: 'Runner',
-    filterChain: 'Ronin',
-    filterType: 'Runner',
-    rarity: 'Common–Legendary',
-    dailyCap: 'Varies by level',
-    multiplier: 'Gear bonus in-app',
-    repairDiscount: 'In-app repair',
-    imageUrl:
-      'https://gateway.lighthouse.storage/ipfs/',
-  },
-  {
-    id: 'ronin-shoebox-preview',
-    title: 'Move+ Shoebox',
-    description: 'Open a shoebox inside Move+ to reveal Ronin runner gear.',
-    chain: 'Ronin',
-    gearType: 'Runner',
-    category: 'Ronin',
-    filterChain: 'Ronin',
-    filterType: 'Runner',
-    rarity: 'Mystery',
-    dailyCap: '—',
-    multiplier: '—',
-    repairDiscount: '—',
-    imageUrl: 'assets/gear/shoebox_a.png',
-  },
-  {
-    id: 'ronin-cycling-preview',
-    title: 'Cycling Gear (Preview)',
-    description: 'Cycling gear collection preview. Full cycling marketplace lives in Move+.',
-    chain: 'Ronin',
-    gearType: 'Cycling',
-    category: 'Cycling',
-    filterChain: 'Ronin',
-    filterType: 'Cycling',
-    rarity: 'Preview',
-    dailyCap: '—',
-    multiplier: '—',
-    repairDiscount: '—',
-    imageUrl: null,
-  },
-  {
-    id: 'base-founder-preview',
-    title: 'Base Founder Gear',
-    description: 'Founder gear on Base chain. Earn with equipped gear inside Move+.',
-    chain: 'Base',
-    gearType: 'Founder Gear',
-    category: 'Founder',
-    filterChain: 'Base',
-    filterType: 'Founder',
-    rarity: 'Founder',
-    dailyCap: '15 km',
-    multiplier: '1.8x',
-    repairDiscount: 'Base repair rules',
-    imageUrl: 'assets/gear/founder_1.png',
-  },
-]
+;(function () {
+  const PLACEHOLDER = './assets/gear/gear_placeholder.png'
+
+  function buildCatalog() {
+    const out = []
+
+    if (
+      window.MovePlusGenesisGear &&
+      typeof window.MovePlusGenesisGear.buildGenesisCatalog === 'function'
+    ) {
+      out.push(...window.MovePlusGenesisGear.buildGenesisCatalog())
+    }
+
+    if (
+      window.MovePlusBaseFounderGear &&
+      typeof window.MovePlusBaseFounderGear.buildBaseFounderCatalog === 'function'
+    ) {
+      out.push(...window.MovePlusBaseFounderGear.buildBaseFounderCatalog())
+    }
+
+    // Fail-safe: never invent Season/Shoebox stubs here.
+    return out
+  }
+
+  window.MOVEPLUS_DIGITAL_GEAR_PREVIEW = buildCatalog()
+  window.MOVEPLUS_DIGITAL_GEAR_PLACEHOLDER = PLACEHOLDER
+
+  window.MOVEPLUS_DIGITAL_GEAR = {
+    rebuild() {
+      window.MOVEPLUS_DIGITAL_GEAR_PREVIEW = buildCatalog()
+      return window.MOVEPLUS_DIGITAL_GEAR_PREVIEW
+    },
+    placeholder: PLACEHOLDER,
+  }
+})()

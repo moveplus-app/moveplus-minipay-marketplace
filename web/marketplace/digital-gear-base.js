@@ -1,7 +1,7 @@
 /**
- * MiniPay Digital Gear — Base Founder Gear #1–#100 (display-only).
+ * MiniPay Digital Gear - Base Founder Gear #1-#100 (display-only).
  * Deterministic designs match Flutter base_founder_gear_assets.dart:
- *   design = ((tokenId - 1) % 10) + 1 → design_1.png … design_10.png
+ *   design = ((tokenId - 1) % 10) + 1 -> design_1.png ... design_10.png
  *
  * App truth: 1.8x multiplier. No 2.2x / 23%. No sale, wallet, or transfer.
  */
@@ -30,34 +30,30 @@
   }
 
   function getBaseFounderDesignLabel(tokenId) {
-    return `Design ${getBaseFounderDesign(tokenId)}`
+    return 'Design ' + getBaseFounderDesign(tokenId)
   }
 
   function getBaseFounderLocalImage(tokenId) {
     const designNumber = getBaseFounderDesign(tokenId)
-    return `${LOCAL_BASE}/design_${designNumber}.png`
+    return LOCAL_BASE + '/design_' + designNumber + '.png'
   }
 
-  /** Optional remote overrides later — currently unused. */
-  function getBaseFounderRemoteCandidates(_tokenId) {
+  function getBaseFounderRemoteCandidates(tokenId) {
     const c = cfg()
     const prefix = String(c.baseFounderImgPrefix || c.BASE_FOUNDER_IMG_PREFIX || '')
       .trim()
       .replace(/\/+$/, '')
     if (!prefix) return []
-    const designNumber = getBaseFounderDesign(_tokenId)
-    return [`${prefix}/design_${designNumber}.png`]
+    const designNumber = getBaseFounderDesign(tokenId)
+    return [prefix + '/design_' + designNumber + '.png']
   }
 
-  /**
-   * Local → optional remote → placeholder. Never leave a broken icon.
-   */
   function getBaseFounderImageCandidates(tokenId) {
     const local = getBaseFounderLocalImage(tokenId)
     const remotes = getBaseFounderRemoteCandidates(tokenId)
-    const ordered = [local, ...remotes, PLACEHOLDER]
+    const ordered = [local].concat(remotes).concat([PLACEHOLDER])
     const seen = {}
-    return ordered.filter((u) => {
+    return ordered.filter(function (u) {
       if (!u || seen[u]) return false
       seen[u] = true
       return true
@@ -97,6 +93,15 @@
     return addr
   }
 
+  function isSafeOpenSeaHttpsUrl(url) {
+    try {
+      const u = new URL(String(url || '').trim())
+      return u.protocol === 'https:' && u.hostname === 'opensea.io'
+    } catch (_) {
+      return false
+    }
+  }
+
   function baseFounderContractAddress() {
     const c = cfg()
     return normalizeContractAddress(
@@ -104,7 +109,39 @@
     )
   }
 
-  /** BaseScan NFT URL only when a public contract address is configured. */
+  function openSeaCollectionUrl() {
+    const c = cfg()
+    const url = String(
+      c.baseFounderGearOpenSeaCollectionUrl || c.BASE_FOUNDER_GEAR_OPENSEA_COLLECTION_URL || '',
+    ).trim()
+    return isSafeOpenSeaHttpsUrl(url) ? url.replace(/\/+$/, '') : null
+  }
+
+  function openSeaItemBaseUrl() {
+    const c = cfg()
+    const url = String(
+      c.baseFounderGearOpenSeaItemBaseUrl || c.BASE_FOUNDER_GEAR_OPENSEA_ITEM_BASE_URL || '',
+    ).trim()
+    return isSafeOpenSeaHttpsUrl(url) ? url.replace(/\/+$/, '') : null
+  }
+
+  function openSeaItemUrl(tokenId, gearMeta) {
+    const id = Math.floor(Number(tokenId))
+    if (!Number.isFinite(id) || id < FOUNDER_FIRST || id > FOUNDER_LAST) return null
+
+    if (gearMeta) {
+      const chain = String(gearMeta.chain || '').trim()
+      const collection = String(gearMeta.collection || '').trim()
+      if (chain && chain !== 'Base') return null
+      if (collection && collection !== 'Base Founder Gear') return null
+    }
+
+    const base = openSeaItemBaseUrl()
+    if (!base) return null
+    const built = base + '/' + id
+    return isSafeOpenSeaHttpsUrl(built) ? built : null
+  }
+
   function baseScanUrl(tokenId) {
     const contract = baseFounderContractAddress()
     if (!contract) return null
@@ -113,8 +150,8 @@
     const base = String(c.baseNftExplorerBase || '')
       .trim()
       .replace(/\/+$/, '')
-    if (base) return `${base}/${contract}/${id}`
-    return `https://basescan.org/nft/${contract}/${id}`
+    if (base) return base + '/' + contract + '/' + id
+    return 'https://basescan.org/nft/' + contract + '/' + id
   }
 
   function buildBaseFounderCatalogItem(tokenId) {
@@ -123,11 +160,13 @@
     const designLabel = getBaseFounderDesignLabel(id)
     const localImage = getBaseFounderLocalImage(id)
     const candidates = getBaseFounderImageCandidates(id)
+    const itemMeta = { chain: 'Base', collection: 'Base Founder Gear' }
+    const openSeaUrl = openSeaItemUrl(id, itemMeta)
     const explorerUrl = baseScanUrl(id)
     return {
-      id: `base-founder-${id}`,
+      id: 'base-founder-' + id,
       tokenId: id,
-      title: `Base Founder Gear #${id}`,
+      title: 'Base Founder Gear #' + id,
       description:
         'Base Founder Gear preview. 100 total supply. Purchase and management are available inside Move+.',
       chain: 'Base',
@@ -139,9 +178,9 @@
       badge: 'FOUNDER',
       rarity: 'FOUNDER',
       rarityKey: 'founder',
-      design: `design_${designNumber}`,
-      designNumber,
-      designLabel,
+      design: 'design_' + designNumber,
+      designNumber: designNumber,
+      designLabel: designLabel,
       multiplier: MULTIPLIER_LABEL,
       supplyNote: '100 total supply',
       previewOnly: true,
@@ -151,7 +190,8 @@
       fallbackImageUrl: localImage,
       imageCandidates: candidates,
       cidImageUrl: null,
-      explorerUrl,
+      openSeaUrl: openSeaUrl,
+      explorerUrl: explorerUrl,
       dailyCap: null,
       repairDiscount: null,
     }
@@ -166,20 +206,24 @@
   }
 
   window.MovePlusBaseFounderGear = {
-    FOUNDER_FIRST,
-    FOUNDER_LAST,
-    DESIGN_COUNT,
-    MULTIPLIER_LABEL,
-    PLACEHOLDER,
-    getBaseFounderDesign,
-    getBaseFounderDesignLabel,
-    getBaseFounderLocalImage,
-    getBaseFounderRemoteCandidates,
-    getBaseFounderImageCandidates,
-    wireBaseImageFallback,
-    buildBaseFounderCatalogItem,
-    buildBaseFounderCatalog,
-    baseFounderContractAddress,
-    baseScanUrl,
+    FOUNDER_FIRST: FOUNDER_FIRST,
+    FOUNDER_LAST: FOUNDER_LAST,
+    DESIGN_COUNT: DESIGN_COUNT,
+    MULTIPLIER_LABEL: MULTIPLIER_LABEL,
+    PLACEHOLDER: PLACEHOLDER,
+    getBaseFounderDesign: getBaseFounderDesign,
+    getBaseFounderDesignLabel: getBaseFounderDesignLabel,
+    getBaseFounderLocalImage: getBaseFounderLocalImage,
+    getBaseFounderRemoteCandidates: getBaseFounderRemoteCandidates,
+    getBaseFounderImageCandidates: getBaseFounderImageCandidates,
+    wireBaseImageFallback: wireBaseImageFallback,
+    buildBaseFounderCatalogItem: buildBaseFounderCatalogItem,
+    buildBaseFounderCatalog: buildBaseFounderCatalog,
+    baseFounderContractAddress: baseFounderContractAddress,
+    baseScanUrl: baseScanUrl,
+    openSeaCollectionUrl: openSeaCollectionUrl,
+    openSeaItemBaseUrl: openSeaItemBaseUrl,
+    openSeaItemUrl: openSeaItemUrl,
+    isSafeOpenSeaHttpsUrl: isSafeOpenSeaHttpsUrl,
   }
 })()
