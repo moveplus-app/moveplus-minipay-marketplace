@@ -96,6 +96,27 @@ export async function isMarketplaceOrderPaidOnChain(
   }
 }
 
+export async function isMarketplaceTokenAllowedOnChain(
+  tokenAddress: string,
+): Promise<boolean | null> {
+  const contractAddress = getMarketplacePaymentsContractAddress()
+  const rpcUrl = Deno.env.get('CELO_RPC_URL')?.trim() ?? ''
+  const token = normalizeEvmAddress(tokenAddress)
+  if (!contractAddress || !rpcUrl || !token) return null
+
+  try {
+    const provider = new ethers.JsonRpcProvider(rpcUrl)
+    const contract = new ethers.Contract(
+      contractAddress,
+      MARKETPLACE_PAYMENTS_ABI,
+      provider,
+    )
+    return Boolean(await contract.allowedTokens(token))
+  } catch {
+    return null
+  }
+}
+
 function isOrderAlreadyPaidError(err: unknown): boolean {
   const msg = String(err ?? '')
   if (msg.includes('OrderAlreadyPaid')) return true
@@ -199,8 +220,8 @@ export async function recordMarketplacePaymentReceipt(params: {
       paymentTxHashBytes32,
     ) as ethers.TransactionResponse
 
-    const receipt = await tx.wait()
-    if (!receipt || receipt.status !== 1) {
+    const onChainReceiptWait = await tx.wait()
+    if (!onChainReceiptWait || onChainReceiptWait.status !== 1) {
       safeError('marketplace_payments_receipt_tx_failed', {
         session_prefix: params.sessionId.slice(0, 8),
       })
@@ -210,11 +231,11 @@ export async function recordMarketplacePaymentReceipt(params: {
     base.recorded = true
     base.pending = false
     base.warning = null
-    base.receiptTxHash = receipt.hash
+    base.receiptTxHash = onChainReceiptWait.hash
 
     safeLog('marketplace_payments_receipt_recorded', {
       session_prefix: params.sessionId.slice(0, 8),
-      receipt_prefix: receipt.hash.slice(0, 10),
+      receipt_prefix: onChainReceiptWait.hash.slice(0, 10),
       order_hash_prefix: orderIdHash.slice(0, 10),
     })
 
