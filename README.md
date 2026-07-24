@@ -199,29 +199,27 @@ Native in-app Energy `createPurchase()` is unchanged.
 ## Icon attribution
 
 
-## Celo Proof of Ship Progress
+## Latest Proof of Ship Update
 
-Move+ Marketplace is a MiniPay-compatible web marketplace connected to the Move+ fitness ecosystem.
+Move+ Marketplace successfully completed a MiniPay-compatible USDT checkout test on Celo mainnet.
 
-### Current shipped features
-- Real item marketplace catalog
-- MiniPay checkout flow
-- Celo mainnet stablecoin support
-- cUSD, USDT, and USDC token selection
-- ERC20 payment verification
-- Successful USDT marketplace payment test
-- Digital Gear preview for Move+ ecosystem assets
-- Mobile-first MiniPay UI
+### Shipped
+- MiniPay marketplace web app
+- Real item checkout flow
+- cUSD / USDT / USDC token selection
+- ERC20 transfer verification
+- USDT payment success screen
+- Digital Gear preview for Move+ assets
+- GitHub repository updated for Proof of Ship
 
-### Latest test
+### Successful test
 - Network: Celo mainnet
 - Token: USDT
 - Amount: 0.001 USDT
 - Status: Payment verified
 - Order status: Awaiting fulfillment
-- Receipt status: On-chain receipt pending
 
 ### Notes
-The current version verifies ERC20 transfers directly on-chain before confirming marketplace orders. Contract receipt recording may be completed later by Move+ because the current deployed contract uses owner-controlled receipt recording.
+MiniPay listing approval is still pending. The marketplace is live and tested in developer mode.
 
 - `link-svgrepo-com.svg` and `wallet-2-svgrepo-com.svg` from [SVG Repo](https://www.svgrepo.com/).
