@@ -3,8 +3,8 @@
  * Status-only query when tx_hash omitted (Check Payment Status).
  */
 
-import { serve } from 'https://'
-import { createClient } from 'https://'
+import { serve } from 'https://deno.land/std@0.168.0/http/server.ts'
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 import {
   fetchTransactionReceipt,
   findErc20TransferToTreasury,
